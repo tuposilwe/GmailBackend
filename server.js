@@ -45,20 +45,33 @@ app.post("/send-email", async (req, res) => {
   res.json({ success: true });
 });
 
-function hasAttachments(structure) {
-  if (!structure) return false;
+function collectAttachments(structure, result = []) {
+  if (!structure) return result;
 
-  // If this part is an attachment
   if (structure.disposition === "attachment") {
-    return true;
+    const filename =
+      structure.dispositionParameters?.filename ||
+      structure.parameters?.name ||
+      "attachment";
+    result.push({
+      filename,
+      contentType: structure.type && structure.subtype
+        ? `${structure.type}/${structure.subtype}`
+        : "application/octet-stream",
+    });
   }
 
-  // Check children recursively
-  if (structure.childNodes && structure.childNodes.length) {
-    return structure.childNodes.some(child => hasAttachments(child));
+  if (structure.childNodes?.length) {
+    for (const child of structure.childNodes) {
+      collectAttachments(child, result);
+    }
   }
 
-  return false;
+  return result;
+}
+
+function hasAttachments(structure) {
+  return collectAttachments(structure).length > 0;
 }
 
 app.get("/emails", async (req, res) => {
@@ -135,7 +148,8 @@ app.get("/emails", async (req, res) => {
         time: timeStr,
         date: date.toISOString(),
         label: "inbox",
-        hasAttachment: hasAttachments(msg.bodyStructure),
+        attachments: collectAttachments(msg.bodyStructure),
+        hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
       });
     }
   } finally {
@@ -220,7 +234,8 @@ app.get("/emails/starred", async (req, res) => {
           time: timeStr,
           date: date.toISOString(),
           label: "inbox",
-          hasAttachment: hasAttachments(msg.bodyStructure),
+          attachments: collectAttachments(msg.bodyStructure),
+          hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
         });
       }
     }
