@@ -1,9 +1,11 @@
 var express = require("express");
+var cors = require("cors");
 var nodemailer = require("nodemailer");
 var { ImapFlow } = require("imapflow");
 require('dotenv').config();
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 app.post("/send-email", async (req, res) => {
