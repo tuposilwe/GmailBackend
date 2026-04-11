@@ -322,6 +322,116 @@ app.get("/emails/:id/attachments/:index", async (req, res) => {
   }
 });
 
+// ── Helper: find a special-use mailbox path ──────────────────────────────────
+async function findMailbox(client, specialUse, fallbackNames = []) {
+  const list = await client.list();
+  let mb = list.find(m => m.specialUse === specialUse);
+  if (mb) return mb.path;
+  for (const name of fallbackNames) {
+    mb = list.find(m => m.path === name || m.name === name);
+    if (mb) return mb.path;
+  }
+  return null;
+}
+
+// ── Helper: run an IMAP action on INBOX then logout ──────────────────────────
+async function inboxAction(res, fn) {
+  const client = makeImapClient();
+  await client.connect();
+  const lock = await client.getMailboxLock("INBOX");
+  try {
+    await fn(client);
+    res.json({ success: true });
+  } finally {
+    lock.release();
+    client.logout().catch(() => {});
+  }
+}
+
+// ── GET /mailboxes — list all folders ────────────────────────────────────────
+app.get("/mailboxes", async (req, res) => {
+  const client = makeImapClient();
+  await client.connect();
+  try {
+    const list = await client.list();
+    res.json(list.map(m => ({ path: m.path, name: m.name, specialUse: m.specialUse || null })));
+  } finally {
+    client.logout().catch(() => {});
+  }
+});
+
+// ── POST /emails/:id/archive ─────────────────────────────────────────────────
+app.post("/emails/:id/archive", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    const dest = await findMailbox(client, "\\Archive", ["Archive", "[Gmail]/All Mail", "All Mail"]);
+    if (dest) {
+      await client.messageMove(`${uid}`, dest, { uid: true });
+    } else {
+      // No archive folder — just remove \Inbox flag (IMAP MOVE not available)
+      await client.messageFlagsAdd(`${uid}`, ["\\Deleted"], { uid: true });
+      await client.messageExpunge();
+    }
+  });
+});
+
+// ── POST /emails/:id/spam ────────────────────────────────────────────────────
+app.post("/emails/:id/spam", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    const dest = await findMailbox(client, "\\Junk", ["Spam", "[Gmail]/Spam", "Junk", "Junk Email"]);
+    if (dest) await client.messageMove(`${uid}`, dest, { uid: true });
+  });
+});
+
+// ── POST /emails/:id/trash ───────────────────────────────────────────────────
+app.post("/emails/:id/trash", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    const dest = await findMailbox(client, "\\Trash", ["Trash", "[Gmail]/Trash", "Deleted Items"]);
+    if (dest) {
+      await client.messageMove(`${uid}`, dest, { uid: true });
+    } else {
+      await client.messageFlagsAdd(`${uid}`, ["\\Deleted"], { uid: true });
+      await client.messageExpunge();
+    }
+  });
+});
+
+// ── POST /emails/:id/mark-unread ─────────────────────────────────────────────
+app.post("/emails/:id/mark-unread", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    await client.messageFlagsRemove(`${uid}`, ["\\Seen"], { uid: true });
+  });
+});
+
+// ── POST /emails/:id/mark-read ───────────────────────────────────────────────
+app.post("/emails/:id/mark-read", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    await client.messageFlagsAdd(`${uid}`, ["\\Seen"], { uid: true });
+  });
+});
+
+// ── POST /emails/:id/star ────────────────────────────────────────────────────
+app.post("/emails/:id/star", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    await client.messageFlagsAdd(`${uid}`, ["\\Flagged"], { uid: true });
+  });
+});
+
+// ── POST /emails/:id/move ────────────────────────────────────────────────────
+app.post("/emails/:id/move", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  const { mailbox } = req.body;
+  if (!mailbox) return res.status(400).json({ error: "mailbox required" });
+  await inboxAction(res, async (client) => {
+    await client.messageMove(`${uid}`, mailbox, { uid: true });
+  });
+});
+
 // console.log(`Your port is ${process.env.PORT}`); // 8626
 
 app.listen(process.env.PORT || 3000, () => console.log(`Server running on port ${process.env.PORT}`));
