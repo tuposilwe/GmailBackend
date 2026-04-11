@@ -2,7 +2,21 @@ var express = require("express");
 var cors = require("cors");
 var nodemailer = require("nodemailer");
 var { ImapFlow } = require("imapflow");
+var { simpleParser } = require("mailparser");
 require('dotenv').config();
+
+function makeImapClient() {
+  return new ImapFlow({
+    host: process.env.IMAP_SERVER,
+    port: process.env.IMAP_PORT,
+    secure: true,
+    auth: {
+      user: process.env.IMAP_USERNAME,
+      pass: process.env.IMAP_PASSWORD
+    },
+    logger: false
+  });
+}
 
 const app = express();
 app.use(cors());
@@ -51,16 +65,7 @@ app.get("/emails", async (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const pagesize = parseInt(req.query.limit) || 50;
 
-  const client = new ImapFlow({
-    host: process.env.IMAP_SERVER,
-    port: process.env.IMAP_PORT,
-    secure: true,
-    auth: {
-      user: process.env.IMAP_USERNAME,
-      pass: process.env.IMAP_PASSWORD
-    },
-    logger: false
-  });
+  const client = makeImapClient();
 
   await client.connect();
 
@@ -105,25 +110,32 @@ app.get("/emails", async (req, res) => {
       flags: true
     })) {
       const subject = msg.envelope.subject || "(No Subject)";
-      const from = msg.envelope.from?.[0]?.address || "Unknown";
+      const fromObj = msg.envelope.from?.[0];
+      const senderEmail = fromObj?.address || "unknown@unknown.com";
+      const senderName = fromObj?.name || senderEmail.split("@")[0];
       const isStarred = msg.flags?.has("\\Flagged");
+      const date = new Date(msg.envelope.date);
+      const now = new Date();
+      const isToday = date.toDateString() === now.toDateString();
+      const timeStr = isToday
+        ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : date.toLocaleDateString([], { month: "short", day: "numeric" });
 
       emails.push({
         id: msg.uid,
         unread: !msg.flags.has('\\Seen'),
         starred: isStarred,
-        sender: from.split("@")[0], // simple name
-        avatar: from.substring(0, 2).toUpperCase(),
-        avatarColor: "#1a73e8", // random or generated later
-        subject: subject,
-        preview: subject.substring(0, 60), // simple preview
-        time: new Date(msg.envelope.date).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit"
-        }),
+        senderName,
+        senderEmail,
+        sender: senderName,
+        avatar: senderName.substring(0, 2).toUpperCase(),
+        avatarColor: "#1a73e8",
+        subject,
+        preview: subject.substring(0, 80),
+        time: timeStr,
+        date: date.toISOString(),
         label: "inbox",
         hasAttachment: hasAttachments(msg.bodyStructure),
-        body: subject // later you can fetch real body
       });
     }
   } finally {
@@ -167,6 +179,40 @@ app.get("/emails", async (req, res) => {
 //   res.json(emails);
 // });
 
+
+app.get("/emails/:id", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  const client = makeImapClient();
+
+  await client.connect();
+  let lock = await client.getMailboxLock("INBOX");
+
+  try {
+    const download = await client.download(`${uid}`, undefined, { uid: true });
+    if (!download) return res.status(404).json({ error: "Message not found" });
+
+    const parsed = await simpleParser(download.content);
+
+    const fromObj = parsed.from?.value?.[0];
+    const toObj = parsed.to?.value?.[0];
+
+    res.json({
+      id: uid,
+      subject: parsed.subject || "(No Subject)",
+      senderName: fromObj?.name || fromObj?.address?.split("@")[0] || "Unknown",
+      senderEmail: fromObj?.address || "",
+      toName: toObj?.name || toObj?.address?.split("@")[0] || "",
+      toEmail: toObj?.address || "",
+      date: parsed.date?.toISOString() || null,
+      text: parsed.text || "",
+      html: parsed.html || "",
+    });
+  } finally {
+    lock.release();
+  }
+
+  await client.logout();
+});
 
 // console.log(`Your port is ${process.env.PORT}`); // 8626
 
