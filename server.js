@@ -248,6 +248,13 @@ app.get("/emails/:id", async (req, res) => {
     const fromObj = parsed.from?.value?.[0];
     const toObj = parsed.to?.value?.[0];
 
+    const attachments = (parsed.attachments || []).map((att, i) => ({
+      index: i,
+      filename: att.filename || `attachment-${i + 1}`,
+      contentType: att.contentType || "application/octet-stream",
+      size: att.size || att.content?.length || 0,
+    }));
+
     res.json({
       id: uid,
       subject: parsed.subject || "(No Subject)",
@@ -258,12 +265,46 @@ app.get("/emails/:id", async (req, res) => {
       date: parsed.date?.toISOString() || null,
       text: parsed.text || "",
       html: parsed.html || "",
+      attachments,
     });
   } finally {
     lock.release();
   }
 
   await client.logout();
+});
+
+app.get("/emails/:id/attachments/:index", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  const index = parseInt(req.params.index);
+  const client = makeImapClient();
+
+  await client.connect();
+  const lock = await client.getMailboxLock("INBOX");
+
+  try {
+    const download = await client.download(`${uid}`, undefined, { uid: true });
+    if (!download) {
+      res.status(404).json({ error: "Message not found" });
+      return;
+    }
+
+    const parsed = await simpleParser(download.content);
+    const att = (parsed.attachments || [])[index];
+    if (!att) {
+      res.status(404).json({ error: "Attachment not found" });
+      return;
+    }
+
+    const filename = encodeURIComponent(att.filename || `attachment-${index + 1}`);
+    res.setHeader("Content-Type", att.contentType || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${filename}`);
+    res.setHeader("Content-Length", att.content.length);
+    res.end(att.content);
+  } finally {
+    lock.release();
+    client.logout().catch(() => {});
+  }
 });
 
 // console.log(`Your port is ${process.env.PORT}`); // 8626
