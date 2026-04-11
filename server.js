@@ -180,6 +180,58 @@ app.get("/emails", async (req, res) => {
 // });
 
 
+app.get("/emails/starred", async (req, res) => {
+  const client = makeImapClient();
+  await client.connect();
+  let lock = await client.getMailboxLock("INBOX");
+  let emails = [];
+
+  try {
+    const uids = await client.search({ flagged: true }, { uid: true });
+
+    if (uids.length > 0) {
+      const uidRange = uids.join(",");
+      for await (let msg of client.fetch(uidRange, {
+        envelope: true,
+        bodyStructure: true,
+        flags: true,
+      }, { uid: true })) {
+        const fromObj = msg.envelope.from?.[0];
+        const senderEmail = fromObj?.address || "unknown@unknown.com";
+        const senderName = fromObj?.name || senderEmail.split("@")[0];
+        const date = new Date(msg.envelope.date);
+        const now = new Date();
+        const isToday = date.toDateString() === now.toDateString();
+        const timeStr = isToday
+          ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : date.toLocaleDateString([], { month: "short", day: "numeric" });
+
+        emails.push({
+          id: msg.uid,
+          unread: !msg.flags.has("\\Seen"),
+          starred: true,
+          senderName,
+          senderEmail,
+          sender: senderName,
+          avatar: senderName.substring(0, 2).toUpperCase(),
+          avatarColor: "#1a73e8",
+          subject: msg.envelope.subject || "(No Subject)",
+          preview: (msg.envelope.subject || "").substring(0, 80),
+          time: timeStr,
+          date: date.toISOString(),
+          label: "inbox",
+          hasAttachment: hasAttachments(msg.bodyStructure),
+        });
+      }
+    }
+  } finally {
+    lock.release();
+  }
+
+  await client.logout();
+  res.json(emails.reverse());
+});
+
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
   const client = makeImapClient();
