@@ -342,6 +342,90 @@ async function inboxAction(res, fn) {
   }
 }
 
+// ── POST /emails/:id/unsubscribe ─────────────────────────────────────────────
+app.post("/emails/:id/unsubscribe", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  const client = makeImapClient();
+  await client.connect();
+  const lock = await client.getMailboxLock("INBOX");
+
+  try {
+    // Fetch only the relevant headers — much faster than downloading the full body
+    let headerBuffer;
+    for await (const msg of client.fetch(`${uid}`, { headers: ["list-unsubscribe", "list-unsubscribe-post"] }, { uid: true })) {
+      headerBuffer = msg.headers;
+    }
+
+    const headerText = headerBuffer ? headerBuffer.toString() : "";
+    // Unfold multi-line header values
+    const unfolded = headerText.replace(/\r?\n[ \t]/g, " ");
+
+    const luMatch  = unfolded.match(/^list-unsubscribe:\s*(.*)/im);
+    const lupMatch = unfolded.match(/^list-unsubscribe-post:\s*(.*)/im);
+    const listUnsubscribe     = luMatch  ? luMatch[1].trim()  : "";
+    const listUnsubscribePost = lupMatch ? lupMatch[1].trim() : "";
+
+    if (!listUnsubscribe) {
+      return res.status(400).json({ error: "No List-Unsubscribe header found" });
+    }
+
+    // Extract <url> tokens from the header value
+    const urls = [...listUnsubscribe.matchAll(/<([^>]+)>/g)].map(m => m[1]);
+    const httpsUrl  = urls.find(u => /^https?:\/\//i.test(u));
+    const mailtoUrl = urls.find(u => /^mailto:/i.test(u));
+
+    let method = "none";
+
+    if (httpsUrl && listUnsubscribePost) {
+      // RFC 8058 one-click unsubscribe
+      await fetch(httpsUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "List-Unsubscribe=One-Click",
+      });
+      method = "http-post";
+    } else if (mailtoUrl) {
+      // Send an unsubscribe email
+      const url     = new URL(mailtoUrl);
+      const to      = url.pathname;
+      const subject = url.searchParams.get("subject") || "Unsubscribe";
+
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_SERVER,
+        port: process.env.SMTP_PORT,
+        secure: true,
+        auth: { user: process.env.SMTP_USERNAME, pass: process.env.SMTP_PASSWORD },
+      });
+
+      await transporter.sendMail({
+        from: process.env.SMTP_USERNAME,
+        to,
+        subject,
+        text: "",
+      });
+      method = "mailto";
+    } else if (httpsUrl) {
+      // Fallback: plain GET to the unsubscribe URL
+      await fetch(httpsUrl);
+      method = "http-get";
+    }
+
+    // Always move to Spam, just like Gmail does
+    const spamFolder = await findMailbox(client, "\\Junk", ["Spam", "[Gmail]/Spam", "Junk", "Junk Email"]);
+    if (spamFolder) {
+      await client.messageMove(`${uid}`, spamFolder, { uid: true });
+    }
+
+    res.json({ success: true, method });
+  } catch (err) {
+    console.error("Unsubscribe error:", err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    lock.release();
+    client.logout().catch(() => {});
+  }
+});
+
 // ── GET /mailboxes — list all folders ────────────────────────────────────────
 app.get("/mailboxes", async (req, res) => {
   const client = makeImapClient();
