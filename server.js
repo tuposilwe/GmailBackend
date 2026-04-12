@@ -5,7 +5,11 @@ var { ImapFlow } = require("imapflow");
 var { simpleParser } = require("mailparser");
 var Database = require("better-sqlite3");
 var path = require("path");
+var multer = require("multer");
 require('dotenv').config();
+
+// multer: keep files in memory so we can pass buffers directly to nodemailer
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
 // ── SQLite – sent contacts ────────────────────────────────────────────────────
 const db = new Database(path.join(__dirname, "contacts.db"));
@@ -158,7 +162,7 @@ app.get("/logo", async (req, res) => {
   res.status(404).end();
 });
 
-app.post("/send-email", async (req, res) => {
+app.post("/send-email", upload.array("attachments"), async (req, res) => {
   const { to, subject, text, html } = req.body;
 
   const transporter = nodemailer.createTransport({
@@ -171,12 +175,19 @@ app.post("/send-email", async (req, res) => {
     }
   });
 
+  const attachments = (req.files || []).map(f => ({
+    filename: f.originalname,
+    content:  f.buffer,
+    contentType: f.mimetype,
+  }));
+
   await transporter.sendMail({
     from: process.env.SMTP_USERNAME,
     to,
     subject,
     text: text || "",
     ...(html ? { html } : {}),
+    ...(attachments.length ? { attachments } : {}),
   });
 
   res.json({ success: true });
