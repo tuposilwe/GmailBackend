@@ -83,19 +83,13 @@ app.get("/emails", async (req, res) => {
   await client.connect();
 
   let emails = [];
+  let total = 0;
   let lock = await client.getMailboxLock("INBOX");
-
-//   let message = await client.fetchOne('*', { flags: true });
-
-// console.log('Flags:', message.flags);
-// console.log('Is seen?', message.flags.has('\\Seen'));
-// console.log('Is flagged?', message.flags.has('\\Flagged'));
-// console.log('Flag color:', message.flagColor); // e.g., 'red', 'yellow'
 
   try {
 
     let mailbox = await client.mailboxOpen("INBOX");
-    let total = mailbox.exists;
+    total = mailbox.exists;
 
     // Calculate start & end
     let end = total - (page - 1) * pagesize;
@@ -157,7 +151,7 @@ app.get("/emails", async (req, res) => {
   }
 
   await client.logout();
-  res.json(emails.reverse());
+  res.json({ emails: emails.reverse(), total });
 });
 
 
