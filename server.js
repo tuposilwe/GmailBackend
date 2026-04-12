@@ -3,7 +3,42 @@ var cors = require("cors");
 var nodemailer = require("nodemailer");
 var { ImapFlow } = require("imapflow");
 var { simpleParser } = require("mailparser");
+var Database = require("better-sqlite3");
+var path = require("path");
 require('dotenv').config();
+
+// ── SQLite – sent contacts ────────────────────────────────────────────────────
+const db = new Database(path.join(__dirname, "contacts.db"));
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sent_contacts (
+    email TEXT PRIMARY KEY COLLATE NOCASE,
+    name  TEXT NOT NULL,
+    sent_count INTEGER NOT NULL DEFAULT 1,
+    last_sent  TEXT NOT NULL
+  )
+`);
+
+const upsertContact = db.prepare(`
+  INSERT INTO sent_contacts (email, name, sent_count, last_sent)
+  VALUES (@email, @name, 1, @last_sent)
+  ON CONFLICT(email) DO UPDATE SET
+    name       = excluded.name,
+    sent_count = sent_contacts.sent_count + 1,
+    last_sent  = excluded.last_sent
+`);
+
+const searchContacts = db.prepare(`
+  SELECT name, email FROM sent_contacts
+  WHERE lower(email) LIKE lower(@q) OR lower(name) LIKE lower(@q)
+  ORDER BY sent_count DESC, last_sent DESC
+  LIMIT 10
+`);
+
+const topContacts = db.prepare(`
+  SELECT name, email FROM sent_contacts
+  ORDER BY sent_count DESC, last_sent DESC
+  LIMIT 50
+`);
 
 // ── In-memory logo cache (domain:source → {buffer, contentType, ts}) ─────────
 const logoCache = new Map();
@@ -111,7 +146,7 @@ app.get("/logo", async (req, res) => {
       logoCache.set(domain, { buffer, contentType, ts: Date.now() });
       res.setHeader("Content-Type",  contentType);
       res.setHeader("Cache-Control", "public, max-age=86400");
-      // console.log(`[logo] ${domain} → ${url}`);
+      console.log(`[logo] ${domain} → ${url}`);
       return res.end(buffer);
     } catch (_) {
       // try next source
@@ -615,6 +650,33 @@ app.post("/emails/:id/move", async (req, res) => {
   await inboxAction(res, async (client) => {
     await client.messageMove(`${uid}`, mailbox, { uid: true });
   });
+});
+
+// ── POST /contacts ───────────────────────────────────────────────────────────
+// Called by the frontend after a successful send to persist recipients.
+// Body: [{ name, email }, ...]
+app.post("/contacts", (req, res) => {
+  const list = Array.isArray(req.body) ? req.body : [];
+  const now = new Date().toISOString();
+  const insertMany = db.transaction((contacts) => {
+    for (const c of contacts) {
+      if (!c.email) continue;
+      upsertContact.run({ email: c.email.trim(), name: (c.name || c.email).trim(), last_sent: now });
+    }
+  });
+  insertMany(list);
+  res.json({ ok: true });
+});
+
+// ── GET /contacts?q=query ────────────────────────────────────────────────────
+// Returns contacts from SQLite only, ordered by sent_count DESC.
+app.get("/contacts", (req, res) => {
+  const q = (req.query.q || "").trim();
+
+  // No query → return top 50 for pre-loading
+  if (!q) return res.json(topContacts.all());
+
+  res.json(searchContacts.all({ q: `%${q}%` }));
 });
 
 // console.log(`Your port is ${process.env.PORT}`); // 8626
