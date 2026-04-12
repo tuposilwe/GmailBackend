@@ -26,16 +26,66 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── GET /logo?domain=example.com&source=clearbit|favicon ─────────────────────
+// ── GET /logo?domain=example.com ─────────────────────────────────────────────
+// Browser-like UA so external services don't block server-side requests
+const LOGO_FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+};
+
+// Subdomains that email-sending services use but aren't the brand domain
+const EMAIL_SUBDOMAINS = new Set([
+  "mail","email","em","e","em1","em2","smtp","smtpout",
+  "mg","mg1","mg2","send","sends","m","bounce","bounces",
+  "marketing","mktg","mkt","news","newsletter","newsletters",
+  "notify","notifications","notification","updates","update",
+  "info","noreply","no-reply","reply","support","hello",
+  "promo","offers","offers1","campaign","campaigns",
+]);
+
+// Returns the sending domain plus brand-domain candidates to try, deduped.
+// e.g. "e.udemymail.com"  → ["e.udemymail.com", "udemymail.com"]
+//      "email.claude.com" → ["email.claude.com", "claude.com"]
+function domainVariants(domain) {
+  const variants = [domain];
+  const parts    = domain.split(".");
+
+  // Strip known email-sending subdomain prefixes
+  if (parts.length > 2 && EMAIL_SUBDOMAINS.has(parts[0])) {
+    variants.push(parts.slice(1).join("."));
+  }
+
+  // Always include apex domain (TLD+1)
+  if (parts.length > 2) {
+    variants.push(parts.slice(-2).join("."));
+  }
+
+  return [...new Set(variants)]; // preserve order, remove duplicates
+}
+
+// For each source type try every domain variant so higher-quality sources
+// are preferred over lower-quality ones (Clearbit > apple-touch > Google favicon …)
+function buildLogoUrlList(domain) {
+  const variants = domainVariants(domain);
+  const urls = [];
+
+  const push = (tpl) => variants.forEach(d => urls.push(tpl(d)));
+
+  push(d => `https://logo.clearbit.com/${d}`);
+  push(d => `https://${d}/apple-touch-icon.png`);
+  push(d => `https://${d}/apple-touch-icon-precomposed.png`);
+  push(d => `https://www.google.com/s2/favicons?domain=${d}&sz=128`);
+  push(d => `https://icons.duckduckgo.com/ip3/${d}.ico`);
+  push(d => `https://${d}/favicon.ico`);
+
+  return [...new Set(urls)];
+}
+
 app.get("/logo", async (req, res) => {
   const domain = (req.query.domain || "").toLowerCase().trim();
-  const source = req.query.source || "auto"; // clearbit | favicon | auto
-
   if (!domain) return res.status(400).end();
 
-  const cacheKey = `${source}:${domain}`;
-  const cached   = logoCache.get(cacheKey);
-
+  const cached = logoCache.get(domain);
   if (cached && Date.now() - cached.ts < LOGO_CACHE_TTL) {
     if (cached.notFound) return res.status(404).end();
     res.setHeader("Content-Type",  cached.contentType);
@@ -43,42 +93,33 @@ app.get("/logo", async (req, res) => {
     return res.end(cached.buffer);
   }
 
-  // Four sources tried in order — most to least logo-quality
-  const urls =
-    source === "clearbit" ? [`https://logo.clearbit.com/${domain}`]
-    : source === "favicon" ? [
-        `https://icons.duckduckgo.com/ip3/${domain}.ico`,
-        `https://www.google.com/s2/favicons?domain=${domain}&sz=128`,
-        `https://${domain}/favicon.ico`,
-      ]
-    : [
-        `https://logo.clearbit.com/${domain}`,
-        `https://icons.duckduckgo.com/ip3/${domain}.ico`,
-        `https://www.google.com/s2/favicons?domain=${domain}&sz=128`,
-        `https://${domain}/favicon.ico`,
-      ];
-
-  for (const url of urls) {
+  for (const url of buildLogoUrlList(domain)) {
     try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      const r = await fetch(url, {
+        signal: AbortSignal.timeout(5000),
+        headers: LOGO_FETCH_HEADERS,
+        redirect: "follow",
+      });
       if (!r.ok) continue;
 
       const contentType = r.headers.get("content-type") || "";
       if (!contentType.startsWith("image/")) continue;
 
       const buffer = Buffer.from(await r.arrayBuffer());
-      if (buffer.length < 100) continue;          // skip 1×1 placeholder images
+      if (buffer.length < 64) continue;   // skip 1×1 placeholder bytes
 
-      logoCache.set(cacheKey, { buffer, contentType, ts: Date.now() });
+      logoCache.set(domain, { buffer, contentType, ts: Date.now() });
       res.setHeader("Content-Type",  contentType);
       res.setHeader("Cache-Control", "public, max-age=86400");
+      // console.log(`[logo] ${domain} → ${url}`);
       return res.end(buffer);
     } catch (_) {
       // try next source
     }
   }
 
-  logoCache.set(cacheKey, { notFound: true, ts: Date.now() });
+  logoCache.set(domain, { notFound: true, ts: Date.now() });
+  console.log(`[logo] ${domain} → not found`);
   res.status(404).end();
 });
 
