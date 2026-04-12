@@ -395,21 +395,97 @@ app.get("/emails/starred", async (req, res) => {
   res.json(emails.reverse());
 });
 
+// ── GET /emails/sent ─────────────────────────────────────────────────────────
+app.get("/emails/sent", async (req, res) => {
+  const page     = parseInt(req.query.page)  || 1;
+  const pagesize = parseInt(req.query.limit) || 50;
+
+  const client = makeImapClient();
+  await client.connect();
+
+  const sentPath = await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"]);
+  if (!sentPath) { await client.logout(); return res.json({ emails: [], total: 0 }); }
+
+  let emails = [];
+  let total  = 0;
+  const lock = await client.getMailboxLock(sentPath);
+
+  try {
+    const mailbox = await client.mailboxOpen(sentPath);
+    total = mailbox.exists;
+    if (total === 0) return res.json({ emails: [], total: 0 });
+
+    const end   = total - (page - 1) * pagesize;
+    const start = Math.max(1, end - pagesize + 1);
+
+    for await (const msg of client.fetch(`${start}:${end}`, {
+      envelope: true,
+      bodyStructure: true,
+      flags: true,
+    })) {
+      const subject   = msg.envelope.subject || "(No Subject)";
+      const toList    = msg.envelope.to || [];
+      const toDisplay = toList.map(t => t.name || t.address).filter(Boolean).join(", ") || "—";
+      const toEmail   = toList[0]?.address || "";
+
+      const date   = new Date(msg.envelope.date);
+      const now    = new Date();
+      const isToday = date.toDateString() === now.toDateString();
+      const timeStr = isToday
+        ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : date.toLocaleDateString([], { month: "short", day: "numeric" });
+
+      emails.push({
+        id:           msg.uid,
+        unread:       !msg.flags.has("\\Seen"),
+        starred:      msg.flags.has("\\Flagged"),
+        senderName:   toDisplay,
+        senderEmail:  toEmail,
+        sender:       toDisplay,
+        avatar:       toDisplay.substring(0, 2).toUpperCase(),
+        avatarColor:  "#34a853",
+        subject,
+        preview:      subject.substring(0, 80),
+        time:         timeStr,
+        date:         date.toISOString(),
+        label:        "sent",
+        attachments:  collectAttachments(msg.bodyStructure),
+        hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+      });
+    }
+  } finally {
+    lock.release();
+  }
+
+  await client.logout();
+  res.json({ emails: emails.reverse(), total });
+});
+
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
+  const folderHint = req.query.folder || "INBOX"; // e.g. "sent"
   const client = makeImapClient();
 
   await client.connect();
-  let lock = await client.getMailboxLock("INBOX");
+
+  // Resolve the real mailbox path from the hint
+  let mailboxPath = "INBOX";
+  if (folderHint === "sent") {
+    mailboxPath = (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
+  }
+
+  const lock = await client.getMailboxLock(mailboxPath);
 
   try {
     const download = await client.download(`${uid}`, undefined, { uid: true });
-    if (!download) return res.status(404).json({ error: "Message not found" });
+    if (!download || !download.content) {
+      return res.status(404).json({ error: "Message not found" });
+    }
 
     const parsed = await simpleParser(download.content);
 
     const fromObj = parsed.from?.value?.[0];
-    const toObj = parsed.to?.value?.[0];
+    const toObj   = parsed.to?.value?.[0];
 
     const attachments = (parsed.attachments || []).map((att, i) => ({
       index: i,
@@ -420,14 +496,14 @@ app.get("/emails/:id", async (req, res) => {
 
     res.json({
       id: uid,
-      subject: parsed.subject || "(No Subject)",
-      senderName: fromObj?.name || fromObj?.address?.split("@")[0] || "Unknown",
+      subject:     parsed.subject || "(No Subject)",
+      senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
       senderEmail: fromObj?.address || "",
-      toName: toObj?.name || toObj?.address?.split("@")[0] || "",
-      toEmail: toObj?.address || "",
-      date: parsed.date?.toISOString() || null,
-      text: parsed.text || "",
-      html: parsed.html || "",
+      toName:      toObj?.name    || toObj?.address?.split("@")[0]  || "",
+      toEmail:     toObj?.address || "",
+      date:        parsed.date?.toISOString() || null,
+      text:        parsed.text || "",
+      html:        parsed.html || "",
       attachments,
     });
   } finally {
@@ -438,16 +514,23 @@ app.get("/emails/:id", async (req, res) => {
 });
 
 app.get("/emails/:id/attachments/:index", async (req, res) => {
-  const uid = parseInt(req.params.id);
+  const uid   = parseInt(req.params.id);
   const index = parseInt(req.params.index);
+  const folderHint = req.query.folder || "INBOX";
   const client = makeImapClient();
 
   await client.connect();
-  const lock = await client.getMailboxLock("INBOX");
+
+  let mailboxPath = "INBOX";
+  if (folderHint === "sent") {
+    mailboxPath = (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
+  }
+
+  const lock = await client.getMailboxLock(mailboxPath);
 
   try {
     const download = await client.download(`${uid}`, undefined, { uid: true });
-    if (!download) {
+    if (!download || !download.content) {
       res.status(404).json({ error: "Message not found" });
       return;
     }
