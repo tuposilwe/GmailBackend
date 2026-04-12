@@ -5,6 +5,10 @@ var { ImapFlow } = require("imapflow");
 var { simpleParser } = require("mailparser");
 require('dotenv').config();
 
+// ── In-memory logo cache (domain:source → {buffer, contentType, ts}) ─────────
+const logoCache = new Map();
+const LOGO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
+
 function makeImapClient() {
   return new ImapFlow({
     host: process.env.IMAP_SERVER,
@@ -21,6 +25,62 @@ function makeImapClient() {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ── GET /logo?domain=example.com&source=clearbit|favicon ─────────────────────
+app.get("/logo", async (req, res) => {
+  const domain = (req.query.domain || "").toLowerCase().trim();
+  const source = req.query.source || "auto"; // clearbit | favicon | auto
+
+  if (!domain) return res.status(400).end();
+
+  const cacheKey = `${source}:${domain}`;
+  const cached   = logoCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.ts < LOGO_CACHE_TTL) {
+    if (cached.notFound) return res.status(404).end();
+    res.setHeader("Content-Type",  cached.contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    return res.end(cached.buffer);
+  }
+
+  // Four sources tried in order — most to least logo-quality
+  const urls =
+    source === "clearbit" ? [`https://logo.clearbit.com/${domain}`]
+    : source === "favicon" ? [
+        `https://icons.duckduckgo.com/ip3/${domain}.ico`,
+        `https://www.google.com/s2/favicons?domain=${domain}&sz=128`,
+        `https://${domain}/favicon.ico`,
+      ]
+    : [
+        `https://logo.clearbit.com/${domain}`,
+        `https://icons.duckduckgo.com/ip3/${domain}.ico`,
+        `https://www.google.com/s2/favicons?domain=${domain}&sz=128`,
+        `https://${domain}/favicon.ico`,
+      ];
+
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!r.ok) continue;
+
+      const contentType = r.headers.get("content-type") || "";
+      if (!contentType.startsWith("image/")) continue;
+
+      const buffer = Buffer.from(await r.arrayBuffer());
+      if (buffer.length < 100) continue;          // skip 1×1 placeholder images
+
+      logoCache.set(cacheKey, { buffer, contentType, ts: Date.now() });
+      res.setHeader("Content-Type",  contentType);
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      return res.end(buffer);
+    } catch (_) {
+      // try next source
+    }
+  }
+
+  logoCache.set(cacheKey, { notFound: true, ts: Date.now() });
+  res.status(404).end();
+});
 
 app.post("/send-email", async (req, res) => {
   const { to, subject, text } = req.body;
@@ -114,7 +174,8 @@ app.get("/emails", async (req, res) => {
       envelope: true,
       bodyStructure: true,
       reverse: true,
-      flags: true
+      flags: true,
+      headers: ["authentication-results"],
     })) {
       const subject = msg.envelope.subject || "(No Subject)";
       const fromObj = msg.envelope.from?.[0];
@@ -127,6 +188,10 @@ app.get("/emails", async (req, res) => {
       const timeStr = isToday
         ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
         : date.toLocaleDateString([], { month: "short", day: "numeric" });
+
+      // Parse Authentication-Results for DKIM / DMARC pass
+      const authRaw = msg.headers ? msg.headers.toString().replace(/\r?\n[ \t]+/g, " ") : "";
+      const verified = /dkim=pass/i.test(authRaw) || /dmarc=pass/i.test(authRaw);
 
       emails.push({
         id: msg.uid,
@@ -142,6 +207,7 @@ app.get("/emails", async (req, res) => {
         time: timeStr,
         date: date.toISOString(),
         label: "inbox",
+        verified,
         attachments: collectAttachments(msg.bodyStructure),
         hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
       });
