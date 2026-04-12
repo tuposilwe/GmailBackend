@@ -159,7 +159,7 @@ app.get("/logo", async (req, res) => {
 });
 
 app.post("/send-email", async (req, res) => {
-  const { to, subject, text } = req.body;
+  const { to, subject, text, html } = req.body;
 
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_SERVER,
@@ -172,10 +172,11 @@ app.post("/send-email", async (req, res) => {
   });
 
   await transporter.sendMail({
-    from: "your@email.com",
+    from: process.env.SMTP_USERNAME,
     to,
     subject,
-    text
+    text: text || "",
+    ...(html ? { html } : {}),
   });
 
   res.json({ success: true });
