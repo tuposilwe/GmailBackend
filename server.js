@@ -123,6 +123,16 @@ const LOGO_FETCH_HEADERS = {
   "Accept": "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
 };
 
+// Explicit domain → brand overrides for domains whose automatic resolution fails.
+// When a domain is listed here the logo is fetched from the mapped brand domain
+// directly, skipping all heuristics.
+const DOMAIN_BRAND_OVERRIDES = {
+  "students.udemy.com":      "udemy.com",
+  "e.udemymail.com":         "udemy.com",
+  "business-email.bolt.eu":  "bolt.eu",
+  "eccouncil.org":           "eccouncil.org",
+};
+
 // Personal / consumer email domains — never show a service logo for these
 const PERSONAL_DOMAINS = new Set([
   "gmail.com","googlemail.com",
@@ -155,50 +165,170 @@ const EMAIL_SUBDOMAINS = new Set([
   "notify","notifications","notification","updates","update",
   "info","noreply","no-reply","reply","support","hello",
   "promo","offers","offers1","campaign","campaigns",
+  "students","accounts","account","auth","login","secure",
 ]);
 
-// Returns the sending domain plus brand-domain candidates to try, deduped.
-// e.g. "e.udemymail.com"  → ["e.udemymail.com", "udemymail.com"]
-//      "email.claude.com" → ["email.claude.com", "claude.com"]
-function domainVariants(domain) {
-  const variants = [domain];
-  const parts    = domain.split(".");
+// Suffixes that companies append to their brand name to form a dedicated
+// email-sending domain, e.g. "udemymail" → brand "udemy", TLD stays the same.
+const EMAIL_SLD_SUFFIXES = [
+  "mail", "email", "mails", "emails",
+  "news", "newsletter", "newsletters",
+  "updates", "update",
+  "marketing", "mktg",
+  "notifications", "notification", "notify",
+  "promo", "promos", "offers",
+  "campaigns", "campaign",
+  "sends", "send",
+  "messages", "message",
+  "comms", "comm",
+];
 
-  // Strip known email-sending subdomain prefixes
-  if (parts.length > 2 && EMAIL_SUBDOMAINS.has(parts[0])) {
-    variants.push(parts.slice(1).join("."));
+// If the SLD (e.g. "udemymail") ends with a known email-domain suffix, return
+// the brand part ("udemy"); otherwise return null.
+function stripEmailSldSuffix(sld) {
+  for (const suffix of EMAIL_SLD_SUFFIXES) {
+    if (sld.length > suffix.length && sld.endsWith(suffix)) {
+      return sld.slice(0, -suffix.length);
+    }
   }
-
-  // Always include apex domain (TLD+1)
-  if (parts.length > 2) {
-    variants.push(parts.slice(-2).join("."));
-  }
-
-  return [...new Set(variants)]; // preserve order, remove duplicates
+  return null;
 }
 
-// For each source type try every domain variant so higher-quality sources
-// are preferred over lower-quality ones (Clearbit > apple-touch > favicon.ico).
-// Google Favicon API and DuckDuckGo are intentionally excluded: they always
-// return a generic icon rather than 404, which prevents the frontend from
-// falling back to coloured initials.
+// Returns brand-domain candidates first, then the original sending domain, deduped.
+// Brand domains are tried first because sending subdomains (e.g. students.udemy.com,
+// e.udemymail.com) are never real websites — fetching icons from them wastes timeout
+// budget before we even reach the actual brand domain.
+//
+// e.g. "students.udemy.com" → ["udemy.com", "students.udemy.com"]
+//      "e.udemymail.com"    → ["udemy.com", "udemymail.com", "e.udemymail.com"]
+//      "email.claude.com"   → ["claude.com", "email.claude.com"]
+//      "jsmastery.pro"      → ["jsmastery.pro"]  (no subdomain, returned as-is)
+function domainVariants(domain) {
+  const parts  = domain.split(".");
+  const brand  = [];
+
+  // Strip known email-sending subdomain prefix (e.g. "students", "e", "mail" …)
+  if (parts.length > 2 && EMAIL_SUBDOMAINS.has(parts[0])) {
+    brand.push(parts.slice(1).join("."));
+  }
+
+  // Apex domain (TLD+1)
+  if (parts.length > 2) {
+    brand.push(parts.slice(-2).join("."));
+  }
+
+  // Strip email-domain suffixes baked into the SLD itself
+  // e.g. "udemymail.com" → "udemy.com"
+  const sld = parts[parts.length - 2];
+  const tld = parts[parts.length - 1];
+  const stripped = stripEmailSldSuffix(sld);
+  if (stripped) {
+    brand.push(`${stripped}.${tld}`);
+  }
+
+  // Brand domains first, original sending domain last (deduped)
+  return [...new Set([...brand, domain])];
+}
+
+// Priority order: live site icons → Clearbit → DuckDuckGo favicon CDN.
+// DuckDuckGo is last because it returns a generic globe icon instead of 404 for
+// unknown domains (which would prevent the frontend falling back to initials).
+// For well-known domains that block direct requests (e.g. udemy.com returns 403),
+// DuckDuckGo reliably serves the real favicon from its own cache.
 function buildLogoUrlList(domain) {
   const variants = domainVariants(domain);
   const urls = [];
 
   const push = (tpl) => variants.forEach(d => urls.push(tpl(d)));
 
-  push(d => `https://logo.clearbit.com/${d}`);
+  // Live site icons first (most up-to-date)
   push(d => `https://${d}/apple-touch-icon.png`);
   push(d => `https://${d}/apple-touch-icon-precomposed.png`);
   push(d => `https://${d}/favicon.ico`);
+  push(d => `https://${d}/favicon.png`);
+  push(d => `https://${d}/favicon.svg`);
+  push(d => `https://${d}/favicon-32x32.png`);
+  push(d => `https://${d}/favicon-16x16.png`);
+  // Clearbit — broad coverage but may be stale or unreachable
+  push(d => `https://logo.clearbit.com/${d}`);
+  // DuckDuckGo favicon CDN — works for bot-protected sites (403s, Cloudflare)
+  push(d => `https://icons.duckduckgo.com/ip3/${d}.ico`);
 
   return [...new Set(urls)];
 }
 
+// Scrape the homepage HTML of a domain to find the favicon/logo URL declared in
+// <link> or <meta> tags — many sites don't put their icon at /favicon.ico at all.
+// Returns the best candidate URL found, or null if nothing usable was found.
+async function scrapeFaviconUrl(domain) {
+  const origins = domainVariants(domain).map(d => `https://${d}`);
+  for (const origin of origins) {
+    try {
+      const r = await fetch(origin, {
+        signal: AbortSignal.timeout(6000),
+        headers: LOGO_FETCH_HEADERS,
+        redirect: "follow",
+      });
+      if (!r.ok) continue;
+      const ct = r.headers.get("content-type") || "";
+      if (!ct.includes("html")) continue;
+
+      const html = await r.text();
+      const candidates = [];
+
+      const resolve = (href) => {
+        if (!href || href.startsWith("data:")) return null;
+        if (href.startsWith("http")) return href;
+        if (href.startsWith("//")) return `https:${href}`;
+        return `${origin}${href.startsWith("/") ? "" : "/"}${href}`;
+      };
+
+      // <link rel="...icon..." href="..."> — both attribute orders
+      const reLink = /<link([^>]+)>/gi;
+      let m;
+      while ((m = reLink.exec(html)) !== null) {
+        const attrs = m[1];
+        const relMatch  = /rel=["']([^"']+)["']/i.exec(attrs);
+        const hrefMatch = /href=["']([^"']+)["']/i.exec(attrs);
+        if (!relMatch || !hrefMatch) continue;
+        const rel = relMatch[1].toLowerCase();
+        if (rel.includes("icon") || rel.includes("apple-touch-icon")) {
+          const url = resolve(hrefMatch[1]);
+          if (url) candidates.push(url);
+        }
+      }
+
+      // <meta property="og:image"> — brand image used for social sharing
+      const ogMatch = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i.exec(html)
+                   || /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i.exec(html);
+      if (ogMatch) {
+        const url = resolve(ogMatch[1]);
+        if (url) candidates.push(url);
+      }
+
+      // <meta name="msapplication-TileImage">
+      const msMatch = /<meta[^>]+name=["']msapplication-TileImage["'][^>]+content=["']([^"']+)["']/i.exec(html)
+                   || /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']msapplication-TileImage["']/i.exec(html);
+      if (msMatch) {
+        const url = resolve(msMatch[1]);
+        if (url) candidates.push(url);
+      }
+
+      if (candidates.length) return candidates[0];
+    } catch (_) { /* try next origin */ }
+  }
+  return null;
+}
+
 app.get("/logo", async (req, res) => {
-  const domain = (req.query.domain || "").toLowerCase().trim();
+  let domain = (req.query.domain || "").toLowerCase().trim();
   if (!domain) return res.status(400).end();
+
+  // Apply explicit brand overrides — redirect lookup to the canonical brand domain.
+  // This handles cases where automatic heuristics fail (e.g. students.udemy.com).
+  if (DOMAIN_BRAND_OVERRIDES[domain]) {
+    domain = DOMAIN_BRAND_OVERRIDES[domain];
+  }
 
   // Personal/consumer email providers — try Gravatar for the person's actual profile
   // photo; if they have none, return 404 so the frontend shows initials.
@@ -239,21 +369,84 @@ app.get("/logo", async (req, res) => {
         headers: LOGO_FETCH_HEADERS,
         redirect: "follow",
       });
-      if (!r.ok) continue;
+      if (!r.ok) {
+        // console.log(`[logo-dbg] ${url} → HTTP ${r.status}`);
+        continue;
+      }
 
       const contentType = r.headers.get("content-type") || "";
-      if (!contentType.startsWith("image/")) continue;
+      if (!contentType.startsWith("image/")) {
+        // console.log(`[logo-dbg] ${url} → bad content-type: ${contentType}`);
+        continue;
+      }
 
       const buffer = Buffer.from(await r.arrayBuffer());
-      if (buffer.length < 64) continue;   // skip 1×1 placeholder bytes
+      if (buffer.length < 64) {
+        console.log(`[logo-dbg] ${url} → too small: ${buffer.length}b`); continue;
+      }
 
       logoCache.set(domain, { buffer, contentType, ts: Date.now() });
       res.setHeader("Content-Type",  contentType);
       res.setHeader("Cache-Control", "public, max-age=86400");
       console.log(`[logo] ${domain} → ${url}`);
       return res.end(buffer);
-    } catch (_) {
-      // try next source
+    } catch (e) {
+      // console.log(`[logo-dbg] ${url} → ${e.message}`);
+    }
+  }
+
+  // Last resort: scrape the homepage to find the real favicon URL
+  try {
+    const scraped = await scrapeFaviconUrl(domain);
+    if (scraped) {
+      const r = await fetch(scraped, {
+        signal: AbortSignal.timeout(5000),
+        headers: LOGO_FETCH_HEADERS,
+        redirect: "follow",
+      });
+      if (r.ok) {
+        const contentType = r.headers.get("content-type") || "";
+        if (contentType.startsWith("image/")) {
+          const buffer = Buffer.from(await r.arrayBuffer());
+          if (buffer.length >= 64) {
+            logoCache.set(domain, { buffer, contentType, ts: Date.now() });
+            res.setHeader("Content-Type",  contentType);
+            res.setHeader("Cache-Control", "public, max-age=86400");
+            console.log(`[logo] ${domain} → ${scraped} (scraped)`);
+            return res.end(buffer);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // console.log(`[logo-dbg] scraper failed: ${e.message}`);
+  }
+
+  // Final fallback: unavatar.io — a favicon CDN that handles bot-protected sites
+  // (Cloudflare-shielded domains like udemy.com that block direct server fetches).
+  // Brand domains come first in domainVariants, so udemy.com is tried before
+  // students.udemy.com.
+  const apexVariants = domainVariants(domain);
+  for (const d of apexVariants) {
+    const unavatarUrl = `https://unavatar.io/${d}?fallback=false`;
+    try {
+      const r = await fetch(unavatarUrl, {
+        signal: AbortSignal.timeout(6000),
+        headers: LOGO_FETCH_HEADERS,
+        redirect: "follow",
+      });
+      if (!r.ok) { console.log(`[logo-dbg] ${unavatarUrl} → HTTP ${r.status}`); continue; }
+      const contentType = r.headers.get("content-type") || "";
+      if (!contentType.startsWith("image/")) { console.log(`[logo-dbg] ${unavatarUrl} → bad content-type: ${contentType}`); continue; }
+      const buffer = Buffer.from(await r.arrayBuffer());
+      if (buffer.length < 64) { console.log(`[logo-dbg] ${unavatarUrl} → too small: ${buffer.length}b`); continue; }
+      logoCache.set(domain, { buffer, contentType, ts: Date.now() });
+      res.setHeader("Content-Type",  contentType);
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      console.log(`[logo] ${domain} → ${unavatarUrl} (unavatar)`);
+      return res.end(buffer);
+    } catch (e) {
+      // console.log(`[logo-dbg] ${unavatarUrl} → ${e.message}`);
     }
   }
 
