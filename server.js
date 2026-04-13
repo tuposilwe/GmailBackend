@@ -651,12 +651,24 @@ async function findMailbox(client, specialUse, fallbackNames = []) {
   return null;
 }
 
-// ── Helper: run an IMAP action on INBOX then logout ──────────────────────────
-async function inboxAction(res, fn) {
+// ── Helper: resolve a folder hint ("sent", "inbox", …) to an IMAP path ───────
+async function resolveMailbox(client, folderHint) {
+  if (!folderHint || folderHint === "inbox") return "INBOX";
+  if (folderHint === "sent") {
+    return (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
+  }
+  return "INBOX";
+}
+
+// ── Helper: run an IMAP action on the given mailbox then logout ───────────────
+async function mailboxAction(res, mailboxPath, fn) {
   const client = makeImapClient();
   try {
     await client.connect();
-    const lock = await client.getMailboxLock("INBOX");
+    const resolvedPath = typeof mailboxPath === "function"
+      ? await mailboxPath(client)
+      : mailboxPath;
+    const lock = await client.getMailboxLock(resolvedPath);
     try {
       await fn(client);
       res.json({ success: true });
@@ -665,10 +677,15 @@ async function inboxAction(res, fn) {
       client.logout().catch(() => {});
     }
   } catch (err) {
-    console.error("[imap] inboxAction error:", err.message);
+    console.error("[imap] mailboxAction error:", err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
     client.logout().catch(() => {});
   }
+}
+
+// Convenience wrapper — keeps all existing callers working unchanged
+async function inboxAction(res, fn) {
+  return mailboxAction(res, "INBOX", fn);
 }
 
 // ── POST /emails/:id/unsubscribe ─────────────────────────────────────────────
@@ -770,12 +787,11 @@ app.get("/mailboxes", async (req, res) => {
 // ── POST /emails/:id/archive ─────────────────────────────────────────────────
 app.post("/emails/:id/archive", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     const dest = await findMailbox(client, "\\Archive", ["Archive", "[Gmail]/All Mail", "All Mail"]);
     if (dest) {
       await client.messageMove(`${uid}`, dest, { uid: true });
     } else {
-      // No archive folder — just remove \Inbox flag (IMAP MOVE not available)
       await client.messageFlagsAdd(`${uid}`, ["\\Deleted"], { uid: true });
       await client.messageExpunge();
     }
@@ -785,7 +801,7 @@ app.post("/emails/:id/archive", async (req, res) => {
 // ── POST /emails/:id/spam ────────────────────────────────────────────────────
 app.post("/emails/:id/spam", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     const dest = await findMailbox(client, "\\Junk", ["Spam", "[Gmail]/Spam", "Junk", "Junk Email"]);
     if (dest) await client.messageMove(`${uid}`, dest, { uid: true });
   });
@@ -794,7 +810,7 @@ app.post("/emails/:id/spam", async (req, res) => {
 // ── POST /emails/:id/trash ───────────────────────────────────────────────────
 app.post("/emails/:id/trash", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     const dest = await findMailbox(client, "\\Trash", ["Trash", "[Gmail]/Trash", "Deleted Items"]);
     if (dest) {
       await client.messageMove(`${uid}`, dest, { uid: true });
@@ -808,7 +824,7 @@ app.post("/emails/:id/trash", async (req, res) => {
 // ── POST /emails/:id/mark-unread ─────────────────────────────────────────────
 app.post("/emails/:id/mark-unread", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     await client.messageFlagsRemove(`${uid}`, ["\\Seen"], { uid: true });
   });
 });
@@ -816,7 +832,7 @@ app.post("/emails/:id/mark-unread", async (req, res) => {
 // ── POST /emails/:id/mark-read ───────────────────────────────────────────────
 app.post("/emails/:id/mark-read", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     await client.messageFlagsAdd(`${uid}`, ["\\Seen"], { uid: true });
   });
 });
@@ -824,7 +840,7 @@ app.post("/emails/:id/mark-read", async (req, res) => {
 // ── POST /emails/:id/star ────────────────────────────────────────────────────
 app.post("/emails/:id/star", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     await client.messageFlagsAdd(`${uid}`, ["\\Flagged"], { uid: true });
   });
 });
@@ -832,7 +848,7 @@ app.post("/emails/:id/star", async (req, res) => {
 // ── POST /emails/:id/unstar ──────────────────────────────────────────────────
 app.post("/emails/:id/unstar", async (req, res) => {
   const uid = parseInt(req.params.id);
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     await client.messageFlagsRemove(`${uid}`, ["\\Flagged"], { uid: true });
   });
 });
@@ -842,7 +858,7 @@ app.post("/emails/:id/move", async (req, res) => {
   const uid = parseInt(req.params.id);
   const { mailbox } = req.body;
   if (!mailbox) return res.status(400).json({ error: "mailbox required" });
-  await inboxAction(res, async (client) => {
+  await mailboxAction(res, (c) => resolveMailbox(c, req.query.folder), async (client) => {
     await client.messageMove(`${uid}`, mailbox, { uid: true });
   });
 });
