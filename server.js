@@ -6,6 +6,7 @@ var { simpleParser } = require("mailparser");
 var Database = require("better-sqlite3");
 var path = require("path");
 var multer = require("multer");
+var crypto = require("crypto");
 require('dotenv').config();
 
 // multer: keep files in memory so we can pass buffers directly to nodemailer
@@ -72,6 +73,30 @@ const LOGO_FETCH_HEADERS = {
   "Accept": "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
 };
 
+// Personal / consumer email domains — never show a service logo for these
+const PERSONAL_DOMAINS = new Set([
+  "gmail.com","googlemail.com",
+  "yahoo.com","yahoo.co.uk","yahoo.fr","yahoo.de","yahoo.es","yahoo.it","yahoo.co.jp",
+  "hotmail.com","hotmail.co.uk","hotmail.fr","hotmail.de","hotmail.es","hotmail.it",
+  "outlook.com","outlook.co.uk","outlook.fr","outlook.de","outlook.es","outlook.it",
+  "live.com","live.co.uk","live.fr","live.de",
+  "msn.com","icloud.com","me.com","mac.com",
+  "aol.com","protonmail.com","proton.me","tutanota.com","tutamail.com",
+  "zoho.com","yandex.com","yandex.ru","mail.ru","inbox.com",
+]);
+
+// Returns up to 2 initials (first letter of each word), e.g. "John Doe" → "JD", "Google" → "G"
+function getInitials(name) {
+  return (name || "?")
+    .trim()
+    .split(/\s+/)
+    .map(w => w[0])
+    .filter(Boolean)
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
+}
+
 // Subdomains that email-sending services use but aren't the brand domain
 const EMAIL_SUBDOMAINS = new Set([
   "mail","email","em","e","em1","em2","smtp","smtpout",
@@ -103,7 +128,10 @@ function domainVariants(domain) {
 }
 
 // For each source type try every domain variant so higher-quality sources
-// are preferred over lower-quality ones (Clearbit > apple-touch > Google favicon …)
+// are preferred over lower-quality ones (Clearbit > apple-touch > favicon.ico).
+// Google Favicon API and DuckDuckGo are intentionally excluded: they always
+// return a generic icon rather than 404, which prevents the frontend from
+// falling back to coloured initials.
 function buildLogoUrlList(domain) {
   const variants = domainVariants(domain);
   const urls = [];
@@ -113,8 +141,6 @@ function buildLogoUrlList(domain) {
   push(d => `https://logo.clearbit.com/${d}`);
   push(d => `https://${d}/apple-touch-icon.png`);
   push(d => `https://${d}/apple-touch-icon-precomposed.png`);
-  push(d => `https://www.google.com/s2/favicons?domain=${d}&sz=128`);
-  push(d => `https://icons.duckduckgo.com/ip3/${d}.ico`);
   push(d => `https://${d}/favicon.ico`);
 
   return [...new Set(urls)];
@@ -123,6 +149,30 @@ function buildLogoUrlList(domain) {
 app.get("/logo", async (req, res) => {
   const domain = (req.query.domain || "").toLowerCase().trim();
   if (!domain) return res.status(400).end();
+
+  // Personal/consumer email providers — try Gravatar for the person's actual profile
+  // photo; if they have none, return 404 so the frontend shows initials.
+  if (PERSONAL_DOMAINS.has(domain)) {
+    const email = (req.query.email || "").toLowerCase().trim();
+    if (email) {
+      const hash = crypto.createHash("md5").update(email).digest("hex");
+      // d=404 → Gravatar returns 404 (not a default image) when no photo exists
+      const gravatarUrl = `https://www.gravatar.com/avatar/${hash}?s=128&d=404&r=g`;
+      try {
+        const r = await fetch(gravatarUrl, { signal: AbortSignal.timeout(4000) });
+        if (r.ok) {
+          const contentType = r.headers.get("content-type") || "image/jpeg";
+          const buffer = Buffer.from(await r.arrayBuffer());
+          if (buffer.length >= 64) {
+            res.setHeader("Content-Type",  contentType);
+            res.setHeader("Cache-Control", "public, max-age=86400");
+            return res.end(buffer);
+          }
+        }
+      } catch (_) { /* no gravatar → fall through to 404 */ }
+    }
+    return res.status(404).end();
+  }
 
   const cached = logoCache.get(domain);
   if (cached && Date.now() - cached.ts < LOGO_CACHE_TTL) {
@@ -160,6 +210,29 @@ app.get("/logo", async (req, res) => {
   logoCache.set(domain, { notFound: true, ts: Date.now() });
   console.log(`[logo] ${domain} → not found`);
   res.status(404).end();
+});
+
+// ── DELETE /logo/cache ───────────────────────────────────────────────────────
+// Clear logo cache. Use ?domain=example.com for specific domain, or no query for all
+app.delete("/logo/cache", (req, res) => {
+  const domain = (req.query.domain || "").toLowerCase().trim();
+  
+  if (domain) {
+    // Clear specific domain
+    const deleted = logoCache.delete(domain);
+    if (deleted) {
+      console.log(`[logo] Cache cleared for ${domain}`);
+      res.json({ success: true, message: `Cache cleared for ${domain}` });
+    } else {
+      res.json({ success: false, message: `No cache entry found for ${domain}` });
+    }
+  } else {
+    // Clear entire cache
+    const size = logoCache.size;
+    logoCache.clear();
+    console.log(`[logo] Cleared entire cache (${size} entries)`);
+    res.json({ success: true, message: `Cleared all ${size} cached logos` });
+  }
 });
 
 app.post("/send-email", upload.array("attachments"), async (req, res) => {
@@ -288,7 +361,7 @@ app.get("/emails", async (req, res) => {
         senderName,
         senderEmail,
         sender: senderName,
-        avatar: senderName.substring(0, 2).toUpperCase(),
+        avatar: getInitials(senderName),
         avatarColor: "#1a73e8",
         subject,
         preview: subject.substring(0, 80),
@@ -375,7 +448,7 @@ app.get("/emails/starred", async (req, res) => {
           senderName,
           senderEmail,
           sender: senderName,
-          avatar: senderName.substring(0, 2).toUpperCase(),
+          avatar: getInitials(senderName),
           avatarColor: "#1a73e8",
           subject: msg.envelope.subject || "(No Subject)",
           preview: (msg.envelope.subject || "").substring(0, 80),
@@ -442,7 +515,7 @@ app.get("/emails/sent", async (req, res) => {
         senderName:   toDisplay,
         senderEmail:  toEmail,
         sender:       toDisplay,
-        avatar:       toDisplay.substring(0, 2).toUpperCase(),
+        avatar:       getInitials(toDisplay),
         avatarColor:  "#34a853",
         subject,
         preview:      subject.substring(0, 80),
