@@ -12,7 +12,7 @@ require('dotenv').config();
 // multer: keep files in memory so we can pass buffers directly to nodemailer
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// ── SQLite – sent contacts ────────────────────────────────────────────────────
+// ── SQLite – contacts + snoozed ───────────────────────────────────────────────
 const db = new Database(path.join(__dirname, "contacts.db"));
 db.exec(`
   CREATE TABLE IF NOT EXISTS sent_contacts (
@@ -20,7 +20,13 @@ db.exec(`
     name  TEXT NOT NULL,
     sent_count INTEGER NOT NULL DEFAULT 1,
     last_sent  TEXT NOT NULL
-  )
+  );
+  CREATE TABLE IF NOT EXISTS snoozed (
+    uid          INTEGER NOT NULL,
+    folder       TEXT    NOT NULL DEFAULT 'inbox',
+    snooze_until TEXT    NOT NULL,
+    PRIMARY KEY (uid, folder)
+  );
 `);
 
 const upsertContact = db.prepare(`
@@ -44,6 +50,11 @@ const topContacts = db.prepare(`
   ORDER BY sent_count DESC, last_sent DESC
   LIMIT 50
 `);
+
+const upsertSnooze       = db.prepare(`INSERT INTO snoozed (uid, folder, snooze_until) VALUES (@uid, @folder, @snooze_until) ON CONFLICT(uid, folder) DO UPDATE SET snooze_until = excluded.snooze_until`);
+const deleteSnooze       = db.prepare(`DELETE FROM snoozed WHERE uid = ? AND folder = ?`);
+const getActiveSnoozed   = db.prepare(`SELECT uid, folder, snooze_until FROM snoozed WHERE snooze_until > ? ORDER BY snooze_until ASC`);
+const deleteExpiredSnooze = db.prepare(`DELETE FROM snoozed WHERE snooze_until <= ?`);
 
 // ── IMAP connection semaphore ─────────────────────────────────────────────────
 // Gmail caps simultaneous IMAP connections (~15). Concurrent React Query
@@ -576,6 +587,81 @@ app.get("/emails/drafts", async (req, res) => {
     console.error("[imap] /emails/drafts error:", err.response || err.message);
     if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
   }
+});
+
+// ── GET /emails/snoozed ──────────────────────────────────────────────────────
+app.get("/emails/snoozed", async (req, res) => {
+  const now = new Date().toISOString();
+  deleteExpiredSnooze.run(now);
+  const rows = getActiveSnoozed.all(now);
+  if (rows.length === 0) return res.json({ emails: [], total: 0 });
+
+  // Group UIDs by source folder so we open each mailbox once
+  const byFolder = {};
+  for (const row of rows) {
+    if (!byFolder[row.folder]) byFolder[row.folder] = [];
+    byFolder[row.folder].push(row);
+  }
+
+  const emailMap = {};
+  try {
+    await withImap(async (client) => {
+      for (const [folderHint, folderRows] of Object.entries(byFolder)) {
+        const mailboxPath = await resolveMailbox(client, folderHint);
+        const lock = await client.getMailboxLock(mailboxPath);
+        try {
+          const uidList = folderRows.map(r => r.uid).join(",");
+          for await (const msg of client.fetch(uidList, { envelope: true, bodyStructure: true, flags: true }, { uid: true })) {
+            const fromObj     = msg.envelope.from?.[0];
+            const senderEmail = fromObj?.address || "unknown@unknown.com";
+            const senderName  = fromObj?.name || senderEmail.split("@")[0];
+            const date        = new Date(msg.envelope.date || Date.now());
+            const isToday     = date.toDateString() === new Date().toDateString();
+            const rowData     = folderRows.find(r => r.uid === msg.uid);
+            emailMap[`${msg.uid}:${folderHint}`] = {
+              id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: msg.flags.has("\\Flagged"),
+              senderName, senderEmail, sender: senderName,
+              avatar: getInitials(senderName), avatarColor: "#1a73e8",
+              subject: msg.envelope.subject || "(No Subject)",
+              preview: (msg.envelope.subject || "").substring(0, 80),
+              time: isToday
+                ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                : date.toLocaleDateString([], { month: "short", day: "numeric" }),
+              date: date.toISOString(), label: "snoozed",
+              snoozeUntil:  rowData?.snooze_until,
+              sourceFolder: folderHint,
+              attachments: collectAttachments(msg.bodyStructure),
+              hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+            };
+          }
+        } finally { lock.release(); }
+      }
+    });
+  } catch (err) {
+    console.error("[imap] /emails/snoozed error:", err.response || err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
+    return;
+  }
+
+  const emails = rows.map(r => emailMap[`${r.uid}:${r.folder}`]).filter(Boolean);
+  res.json({ emails, total: emails.length });
+});
+
+// ── POST /emails/:id/snooze ───────────────────────────────────────────────────
+app.post("/emails/:id/snooze", (req, res) => {
+  const uid = parseInt(req.params.id);
+  const { snooze_until, folder = "inbox" } = req.body;
+  if (!snooze_until) return res.status(400).json({ error: "snooze_until required" });
+  upsertSnooze.run({ uid, folder, snooze_until });
+  res.json({ success: true });
+});
+
+// ── DELETE /emails/:id/snooze — remove snooze (unsnooze) ─────────────────────
+app.delete("/emails/:id/snooze", (req, res) => {
+  const uid = parseInt(req.params.id);
+  const folder = req.query.folder || "inbox";
+  deleteSnooze.run(uid, folder);
+  res.json({ success: true });
 });
 
 // ── GET /emails/trash ────────────────────────────────────────────────────────
