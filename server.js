@@ -578,6 +578,50 @@ app.get("/emails/drafts", async (req, res) => {
   }
 });
 
+// ── GET /emails/trash ────────────────────────────────────────────────────────
+app.get("/emails/trash", async (req, res) => {
+  const page     = parseInt(req.query.page)  || 1;
+  const pagesize = parseInt(req.query.limit) || 50;
+  try {
+    await withImap(async (client) => {
+      const trashPath = await findMailbox(client, "\\Trash", ["Trash", "[Gmail]/Trash", "Deleted Items"]);
+      if (!trashPath) return res.json({ emails: [], total: 0 });
+      let emails = [], total = 0;
+      const lock = await client.getMailboxLock(trashPath);
+      try {
+        total = (await client.mailboxOpen(trashPath)).exists;
+        if (total === 0) return res.json({ emails: [], total: 0 });
+        const end = total - (page - 1) * pagesize, start = Math.max(1, end - pagesize + 1);
+        for await (const msg of client.fetch(`${start}:${end}`, { envelope: true, bodyStructure: true, flags: true })) {
+          const fromObj     = msg.envelope.from?.[0];
+          const senderEmail = fromObj?.address || "unknown@unknown.com";
+          const senderName  = fromObj?.name || senderEmail.split("@")[0];
+          const date        = new Date(msg.envelope.date || Date.now());
+          const isToday     = date.toDateString() === new Date().toDateString();
+          emails.push({
+            id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: msg.flags.has("\\Flagged"),
+            senderName, senderEmail, sender: senderName,
+            avatar: getInitials(senderName), avatarColor: "#1a73e8",
+            subject: msg.envelope.subject || "(No Subject)",
+            preview: (msg.envelope.subject || "").substring(0, 80),
+            time: isToday
+              ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+              : date.toLocaleDateString([], { month: "short", day: "numeric" }),
+            date: date.toISOString(), label: "trash",
+            attachments: collectAttachments(msg.bodyStructure),
+            hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+          });
+        }
+      } finally { lock.release(); }
+      emails.sort((a, b) => new Date(b.date) - new Date(a.date));
+      res.json({ emails, total });
+    });
+  } catch (err) {
+    console.error("[imap] /emails/trash error:", err.response || err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
+  }
+});
+
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
   const folderHint = req.query.folder || "inbox";
@@ -663,6 +707,9 @@ async function resolveMailbox(client, folderHint) {
   }
   if (folderHint === "drafts") {
     return (await findMailbox(client, "\\Drafts", ["Drafts", "[Gmail]/Drafts", "Draft"])) || "INBOX";
+  }
+  if (folderHint === "trash") {
+    return (await findMailbox(client, "\\Trash",  ["Trash", "[Gmail]/Trash", "Deleted Items"])) || "INBOX";
   }
   return "INBOX";
 }
@@ -762,8 +809,7 @@ app.post("/emails/:id/archive", async (req, res) => {
     if (dest) {
       await client.messageMove(`${uid}`, dest, { uid: true });
     } else {
-      await client.messageFlagsAdd(`${uid}`, ["\\Deleted"], { uid: true });
-      await client.messageExpunge();
+      await client.messageDelete(`${uid}`, { uid: true });
     }
   });
 });
@@ -777,6 +823,7 @@ app.post("/emails/:id/spam", async (req, res) => {
   });
 });
 
+// ── GET /emails/trash ────────────────────────────────────────────────────────
 // ── POST /emails/:id/trash ───────────────────────────────────────────────────
 app.post("/emails/:id/trash", async (req, res) => {
   const uid = parseInt(req.params.id);
@@ -785,9 +832,24 @@ app.post("/emails/:id/trash", async (req, res) => {
     if (dest) {
       await client.messageMove(`${uid}`, dest, { uid: true });
     } else {
-      await client.messageFlagsAdd(`${uid}`, ["\\Deleted"], { uid: true });
-      await client.messageExpunge();
+      await client.messageDelete(`${uid}`, { uid: true });
     }
+  });
+});
+
+// ── POST /emails/:id/restore — move from Trash back to Inbox ─────────────────
+app.post("/emails/:id/restore", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await mailboxAction(res, (c) => resolveMailbox(c, "trash"), async (client) => {
+    await client.messageMove(`${uid}`, "INBOX", { uid: true });
+  });
+});
+
+// ── POST /emails/:id/delete-forever — permanently delete from Trash ───────────
+app.post("/emails/:id/delete-forever", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await mailboxAction(res, (c) => resolveMailbox(c, "trash"), async (client) => {
+    await client.messageDelete(`${uid}`, { uid: true });
   });
 });
 
