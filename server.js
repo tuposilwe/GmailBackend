@@ -50,7 +50,7 @@ const logoCache = new Map();
 const LOGO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
 
 function makeImapClient() {
-  return new ImapFlow({
+  const client = new ImapFlow({
     host: process.env.IMAP_SERVER,
     port: parseInt(process.env.IMAP_PORT),
     secure: true,
@@ -60,6 +60,12 @@ function makeImapClient() {
     },
     logger: false
   });
+  // Prevent unhandled 'error' events (e.g. ETIMEOUT) from crashing the process.
+  // Errors are surfaced through rejected promises in the route handlers instead.
+  client.on("error", (err) => {
+    console.error("[imap] socket error:", err.message);
+  });
+  return client;
 }
 
 const app = express();
@@ -300,85 +306,73 @@ app.get("/emails", async (req, res) => {
   const pagesize = parseInt(req.query.limit) || 50;
 
   const client = makeImapClient();
-
-  await client.connect();
-
-  let emails = [];
-  let total = 0;
-  let lock = await client.getMailboxLock("INBOX");
-
   try {
+    await client.connect();
 
-    let mailbox = await client.mailboxOpen("INBOX");
-    total = mailbox.exists;
+    let emails = [];
+    let total = 0;
+    let lock = await client.getMailboxLock("INBOX");
 
-    // Calculate start & end
-    let end = total - (page - 1) * pagesize;
-    let start = Math.max(1, end - pagesize + 1);
+    try {
+      let mailbox = await client.mailboxOpen("INBOX");
+      total = mailbox.exists;
 
-    let range = `${start}:${end}`;
+      let end = total - (page - 1) * pagesize;
+      let start = Math.max(1, end - pagesize + 1);
+      let range = `${start}:${end}`;
 
-    console.log("Page:", page);
-    console.log("Range:", range);
+      for await (let msg of client.fetch(range, {
+        envelope: true,
+        bodyStructure: true,
+        reverse: true,
+        flags: true,
+        headers: ["authentication-results"],
+      })) {
+        const subject = msg.envelope.subject || "(No Subject)";
+        const fromObj = msg.envelope.from?.[0];
+        const senderEmail = fromObj?.address || "unknown@unknown.com";
+        const senderName = fromObj?.name || senderEmail.split("@")[0];
+        const isStarred = msg.flags?.has("\\Flagged");
+        const date = new Date(msg.envelope.date);
+        const now = new Date();
+        const isToday = date.toDateString() === now.toDateString();
+        const timeStr = isToday
+          ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : date.toLocaleDateString([], { month: "short", day: "numeric" });
 
-    // await client.messageFlagsAdd(uid, ["\\Flagged"]);
-    // await client.messageFlagsRemove(uid, ["\\Flagged"]);
+        const authRaw = msg.headers ? msg.headers.toString().replace(/\r?\n[ \t]+/g, " ") : "";
+        const verified = /dkim=pass/i.test(authRaw) || /dmarc=pass/i.test(authRaw);
 
-    // List mailboxes
-        // let mailboxes = await client.list();
-        // console.log('Available mailboxes:');
-        // for (let mailbox of mailboxes) {
-        //     console.log(`  ${mailbox.path} ${mailbox.specialUse || ''}`);
-        // }
-
-    for await (let msg of client.fetch(range, {
-      envelope: true,
-      bodyStructure: true,
-      reverse: true,
-      flags: true,
-      headers: ["authentication-results"],
-    })) {
-      const subject = msg.envelope.subject || "(No Subject)";
-      const fromObj = msg.envelope.from?.[0];
-      const senderEmail = fromObj?.address || "unknown@unknown.com";
-      const senderName = fromObj?.name || senderEmail.split("@")[0];
-      const isStarred = msg.flags?.has("\\Flagged");
-      const date = new Date(msg.envelope.date);
-      const now = new Date();
-      const isToday = date.toDateString() === now.toDateString();
-      const timeStr = isToday
-        ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-        : date.toLocaleDateString([], { month: "short", day: "numeric" });
-
-      // Parse Authentication-Results for DKIM / DMARC pass
-      const authRaw = msg.headers ? msg.headers.toString().replace(/\r?\n[ \t]+/g, " ") : "";
-      const verified = /dkim=pass/i.test(authRaw) || /dmarc=pass/i.test(authRaw);
-
-      emails.push({
-        id: msg.uid,
-        unread: !msg.flags.has('\\Seen'),
-        starred: isStarred,
-        senderName,
-        senderEmail,
-        sender: senderName,
-        avatar: getInitials(senderName),
-        avatarColor: "#1a73e8",
-        subject,
-        preview: subject.substring(0, 80),
-        time: timeStr,
-        date: date.toISOString(),
-        label: "inbox",
-        verified,
-        attachments: collectAttachments(msg.bodyStructure),
-        hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
-      });
+        emails.push({
+          id: msg.uid,
+          unread: !msg.flags.has("\\Seen"),
+          starred: isStarred,
+          senderName,
+          senderEmail,
+          sender: senderName,
+          avatar: getInitials(senderName),
+          avatarColor: "#1a73e8",
+          subject,
+          preview: subject.substring(0, 80),
+          time: timeStr,
+          date: date.toISOString(),
+          label: "inbox",
+          verified,
+          attachments: collectAttachments(msg.bodyStructure),
+          hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+        });
+      }
+    } finally {
+      lock.release();
     }
-  } finally {
-    lock.release();
-  }
 
-  await client.logout();
-  res.json({ emails: emails.reverse(), total });
+    await client.logout();
+    res.json({ emails: emails.reverse(), total });
+  } catch (err) {
+    console.error("[imap] /emails error:", err.message);
+    client.logout().catch(() => {});
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 
@@ -417,55 +411,61 @@ app.get("/emails", async (req, res) => {
 
 app.get("/emails/starred", async (req, res) => {
   const client = makeImapClient();
-  await client.connect();
-  let lock = await client.getMailboxLock("INBOX");
-  let emails = [];
-
   try {
-    const uids = await client.search({ flagged: true }, { uid: true });
+    await client.connect();
+    const lock = await client.getMailboxLock("INBOX");
+    let emails = [];
 
-    if (uids.length > 0) {
-      const uidRange = uids.join(",");
-      for await (let msg of client.fetch(uidRange, {
-        envelope: true,
-        bodyStructure: true,
-        flags: true,
-      }, { uid: true })) {
-        const fromObj = msg.envelope.from?.[0];
-        const senderEmail = fromObj?.address || "unknown@unknown.com";
-        const senderName = fromObj?.name || senderEmail.split("@")[0];
-        const date = new Date(msg.envelope.date);
-        const now = new Date();
-        const isToday = date.toDateString() === now.toDateString();
-        const timeStr = isToday
-          ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-          : date.toLocaleDateString([], { month: "short", day: "numeric" });
+    try {
+      const uids = await client.search({ flagged: true }, { uid: true });
 
-        emails.push({
-          id: msg.uid,
-          unread: !msg.flags.has("\\Seen"),
-          starred: true,
-          senderName,
-          senderEmail,
-          sender: senderName,
-          avatar: getInitials(senderName),
-          avatarColor: "#1a73e8",
-          subject: msg.envelope.subject || "(No Subject)",
-          preview: (msg.envelope.subject || "").substring(0, 80),
-          time: timeStr,
-          date: date.toISOString(),
-          label: "inbox",
-          attachments: collectAttachments(msg.bodyStructure),
-          hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
-        });
+      if (uids.length > 0) {
+        const uidRange = uids.join(",");
+        for await (let msg of client.fetch(uidRange, {
+          envelope: true,
+          bodyStructure: true,
+          flags: true,
+        }, { uid: true })) {
+          const fromObj = msg.envelope.from?.[0];
+          const senderEmail = fromObj?.address || "unknown@unknown.com";
+          const senderName = fromObj?.name || senderEmail.split("@")[0];
+          const date = new Date(msg.envelope.date);
+          const now = new Date();
+          const isToday = date.toDateString() === now.toDateString();
+          const timeStr = isToday
+            ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            : date.toLocaleDateString([], { month: "short", day: "numeric" });
+
+          emails.push({
+            id: msg.uid,
+            unread: !msg.flags.has("\\Seen"),
+            starred: true,
+            senderName,
+            senderEmail,
+            sender: senderName,
+            avatar: getInitials(senderName),
+            avatarColor: "#1a73e8",
+            subject: msg.envelope.subject || "(No Subject)",
+            preview: (msg.envelope.subject || "").substring(0, 80),
+            time: timeStr,
+            date: date.toISOString(),
+            label: "inbox",
+            attachments: collectAttachments(msg.bodyStructure),
+            hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+          });
+        }
       }
+    } finally {
+      lock.release();
     }
-  } finally {
-    lock.release();
-  }
 
-  await client.logout();
-  res.json(emails.reverse());
+    await client.logout();
+    res.json(emails.reverse());
+  } catch (err) {
+    console.error("[imap] /emails/starred error:", err.message);
+    client.logout().catch(() => {});
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 // ── GET /emails/sent ─────────────────────────────────────────────────────────
@@ -474,116 +474,125 @@ app.get("/emails/sent", async (req, res) => {
   const pagesize = parseInt(req.query.limit) || 50;
 
   const client = makeImapClient();
-  await client.connect();
-
-  const sentPath = await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"]);
-  if (!sentPath) { await client.logout(); return res.json({ emails: [], total: 0 }); }
-
-  let emails = [];
-  let total  = 0;
-  const lock = await client.getMailboxLock(sentPath);
-
   try {
-    const mailbox = await client.mailboxOpen(sentPath);
-    total = mailbox.exists;
-    if (total === 0) return res.json({ emails: [], total: 0 });
+    await client.connect();
 
-    const end   = total - (page - 1) * pagesize;
-    const start = Math.max(1, end - pagesize + 1);
+    const sentPath = await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"]);
+    if (!sentPath) { await client.logout(); return res.json({ emails: [], total: 0 }); }
 
-    for await (const msg of client.fetch(`${start}:${end}`, {
-      envelope: true,
-      bodyStructure: true,
-      flags: true,
-    })) {
-      const subject   = msg.envelope.subject || "(No Subject)";
-      const toList    = msg.envelope.to || [];
-      const toDisplay = toList.map(t => t.name || t.address).filter(Boolean).join(", ") || "—";
-      const toEmail   = toList[0]?.address || "";
+    let emails = [];
+    let total  = 0;
+    const lock = await client.getMailboxLock(sentPath);
 
-      const date   = new Date(msg.envelope.date);
-      const now    = new Date();
-      const isToday = date.toDateString() === now.toDateString();
-      const timeStr = isToday
-        ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-        : date.toLocaleDateString([], { month: "short", day: "numeric" });
+    try {
+      const mailbox = await client.mailboxOpen(sentPath);
+      total = mailbox.exists;
+      if (total === 0) { lock.release(); await client.logout(); return res.json({ emails: [], total: 0 }); }
 
-      emails.push({
-        id:           msg.uid,
-        unread:       !msg.flags.has("\\Seen"),
-        starred:      msg.flags.has("\\Flagged"),
-        senderName:   toDisplay,
-        senderEmail:  toEmail,
-        sender:       toDisplay,
-        avatar:       getInitials(toDisplay),
-        avatarColor:  "#34a853",
-        subject,
-        preview:      subject.substring(0, 80),
-        time:         timeStr,
-        date:         date.toISOString(),
-        label:        "sent",
-        attachments:  collectAttachments(msg.bodyStructure),
-        hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
-      });
+      const end   = total - (page - 1) * pagesize;
+      const start = Math.max(1, end - pagesize + 1);
+
+      for await (const msg of client.fetch(`${start}:${end}`, {
+        envelope: true,
+        bodyStructure: true,
+        flags: true,
+      })) {
+        const subject   = msg.envelope.subject || "(No Subject)";
+        const toList    = msg.envelope.to || [];
+        const toDisplay = toList.map(t => t.name || t.address).filter(Boolean).join(", ") || "—";
+        const toEmail   = toList[0]?.address || "";
+
+        const date   = new Date(msg.envelope.date);
+        const now    = new Date();
+        const isToday = date.toDateString() === now.toDateString();
+        const timeStr = isToday
+          ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : date.toLocaleDateString([], { month: "short", day: "numeric" });
+
+        emails.push({
+          id:           msg.uid,
+          unread:       !msg.flags.has("\\Seen"),
+          starred:      msg.flags.has("\\Flagged"),
+          senderName:   toDisplay,
+          senderEmail:  toEmail,
+          sender:       toDisplay,
+          avatar:       getInitials(toDisplay),
+          avatarColor:  "#34a853",
+          subject,
+          preview:      subject.substring(0, 80),
+          time:         timeStr,
+          date:         date.toISOString(),
+          label:        "sent",
+          attachments:  collectAttachments(msg.bodyStructure),
+          hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+        });
+      }
+    } finally {
+      lock.release();
     }
-  } finally {
-    lock.release();
-  }
 
-  await client.logout();
-  res.json({ emails: emails.reverse(), total });
+    await client.logout();
+    res.json({ emails: emails.reverse(), total });
+  } catch (err) {
+    console.error("[imap] /emails/sent error:", err.message);
+    client.logout().catch(() => {});
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
-  const folderHint = req.query.folder || "INBOX"; // e.g. "sent"
+  const folderHint = req.query.folder || "INBOX";
   const client = makeImapClient();
 
-  await client.connect();
-
-  // Resolve the real mailbox path from the hint
-  let mailboxPath = "INBOX";
-  if (folderHint === "sent") {
-    mailboxPath = (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
-  }
-
-  const lock = await client.getMailboxLock(mailboxPath);
-
   try {
-    const download = await client.download(`${uid}`, undefined, { uid: true });
-    if (!download || !download.content) {
-      return res.status(404).json({ error: "Message not found" });
+    await client.connect();
+
+    let mailboxPath = "INBOX";
+    if (folderHint === "sent") {
+      mailboxPath = (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
     }
 
-    const parsed = await simpleParser(download.content);
+    const lock = await client.getMailboxLock(mailboxPath);
+    try {
+      const download = await client.download(`${uid}`, undefined, { uid: true });
+      if (!download || !download.content) {
+        return res.status(404).json({ error: "Message not found" });
+      }
 
-    const fromObj = parsed.from?.value?.[0];
-    const toObj   = parsed.to?.value?.[0];
+      const parsed = await simpleParser(download.content);
+      const fromObj = parsed.from?.value?.[0];
+      const toObj   = parsed.to?.value?.[0];
 
-    const attachments = (parsed.attachments || []).map((att, i) => ({
-      index: i,
-      filename: att.filename || `attachment-${i + 1}`,
-      contentType: att.contentType || "application/octet-stream",
-      size: att.size || att.content?.length || 0,
-    }));
+      const attachments = (parsed.attachments || []).map((att, i) => ({
+        index: i,
+        filename: att.filename || `attachment-${i + 1}`,
+        contentType: att.contentType || "application/octet-stream",
+        size: att.size || att.content?.length || 0,
+      }));
 
-    res.json({
-      id: uid,
-      subject:     parsed.subject || "(No Subject)",
-      senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
-      senderEmail: fromObj?.address || "",
-      toName:      toObj?.name    || toObj?.address?.split("@")[0]  || "",
-      toEmail:     toObj?.address || "",
-      date:        parsed.date?.toISOString() || null,
-      text:        parsed.text || "",
-      html:        parsed.html || "",
-      attachments,
-    });
-  } finally {
-    lock.release();
+      res.json({
+        id: uid,
+        subject:     parsed.subject || "(No Subject)",
+        senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
+        senderEmail: fromObj?.address || "",
+        toName:      toObj?.name    || toObj?.address?.split("@")[0]  || "",
+        toEmail:     toObj?.address || "",
+        date:        parsed.date?.toISOString() || null,
+        text:        parsed.text || "",
+        html:        parsed.html || "",
+        attachments,
+      });
+    } finally {
+      lock.release();
+    }
+
+    await client.logout();
+  } catch (err) {
+    console.error("[imap] /emails/:id error:", err.message);
+    client.logout().catch(() => {});
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
-
-  await client.logout();
 });
 
 app.get("/emails/:id/attachments/:index", async (req, res) => {
@@ -592,37 +601,41 @@ app.get("/emails/:id/attachments/:index", async (req, res) => {
   const folderHint = req.query.folder || "INBOX";
   const client = makeImapClient();
 
-  await client.connect();
-
-  let mailboxPath = "INBOX";
-  if (folderHint === "sent") {
-    mailboxPath = (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
-  }
-
-  const lock = await client.getMailboxLock(mailboxPath);
-
   try {
-    const download = await client.download(`${uid}`, undefined, { uid: true });
-    if (!download || !download.content) {
-      res.status(404).json({ error: "Message not found" });
-      return;
+    await client.connect();
+
+    let mailboxPath = "INBOX";
+    if (folderHint === "sent") {
+      mailboxPath = (await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"])) || "INBOX";
     }
 
-    const parsed = await simpleParser(download.content);
-    const att = (parsed.attachments || [])[index];
-    if (!att) {
-      res.status(404).json({ error: "Attachment not found" });
-      return;
+    const lock = await client.getMailboxLock(mailboxPath);
+    try {
+      const download = await client.download(`${uid}`, undefined, { uid: true });
+      if (!download || !download.content) {
+        return res.status(404).json({ error: "Message not found" });
+      }
+
+      const parsed = await simpleParser(download.content);
+      const att = (parsed.attachments || [])[index];
+      if (!att) {
+        return res.status(404).json({ error: "Attachment not found" });
+      }
+
+      const filename = encodeURIComponent(att.filename || `attachment-${index + 1}`);
+      res.setHeader("Content-Type", att.contentType || "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${filename}`);
+      res.setHeader("Content-Length", att.content.length);
+      res.end(att.content);
+    } finally {
+      lock.release();
     }
 
-    const filename = encodeURIComponent(att.filename || `attachment-${index + 1}`);
-    res.setHeader("Content-Type", att.contentType || "application/octet-stream");
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${filename}`);
-    res.setHeader("Content-Length", att.content.length);
-    res.end(att.content);
-  } finally {
-    lock.release();
     client.logout().catch(() => {});
+  } catch (err) {
+    console.error("[imap] /emails/:id/attachments error:", err.message);
+    client.logout().catch(() => {});
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
@@ -641,13 +654,19 @@ async function findMailbox(client, specialUse, fallbackNames = []) {
 // ── Helper: run an IMAP action on INBOX then logout ──────────────────────────
 async function inboxAction(res, fn) {
   const client = makeImapClient();
-  await client.connect();
-  const lock = await client.getMailboxLock("INBOX");
   try {
-    await fn(client);
-    res.json({ success: true });
-  } finally {
-    lock.release();
+    await client.connect();
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      await fn(client);
+      res.json({ success: true });
+    } finally {
+      lock.release();
+      client.logout().catch(() => {});
+    }
+  } catch (err) {
+    console.error("[imap] inboxAction error:", err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
     client.logout().catch(() => {});
   }
 }
