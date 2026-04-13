@@ -51,11 +51,11 @@ const LOGO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
 function makeImapClient() {
   return new ImapFlow({
     host: process.env.IMAP_SERVER,
-    port: process.env.IMAP_PORT,
+    port: parseInt(process.env.IMAP_PORT),
     secure: true,
     auth: {
       user: process.env.IMAP_USERNAME,
-      pass: process.env.IMAP_PASSWORD
+      pass: process.env.IMAP_PASSWORD.replace(/\s/g, "")
     },
     logger: false
   });
