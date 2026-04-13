@@ -1008,6 +1008,34 @@ app.get("/contacts", (req, res) => {
   res.json(searchContacts.all({ q: `%${q}%` }));
 });
 
+// ── GET /storage — IMAP quota (used / limit in bytes) ────────────────────────
+app.get("/storage", async (req, res) => {
+  try {
+    await withImap(async (client) => {
+      try {
+        const quota = await client.getQuota("INBOX");
+        const storage = quota?.storage;
+        if (storage && storage.limit > 0) {
+          // ImapFlow already converts IMAP KB units → bytes
+          const usedBytes  = storage.usage;
+          const limitBytes = storage.limit;
+          const percent    = Math.min(100, Math.round((usedBytes / limitBytes) * 100));
+          const fmt = (bytes) => {
+            const gb = bytes / (1024 ** 3);
+            return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(bytes / (1024 ** 2)).toFixed(0)} MB`;
+          };
+          return res.json({ used: usedBytes, limit: limitBytes, percent, usedFmt: fmt(usedBytes), limitFmt: fmt(limitBytes) });
+        }
+        res.json({ error: "no_quota" });
+      } catch {
+        res.json({ error: "quota_not_supported" });
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.response || err.message });
+  }
+});
+
 // console.log(`Your port is ${process.env.PORT}`); // 8626
 
 app.listen(process.env.PORT || 3000, () => console.log(`Server running on port ${process.env.PORT}`));
