@@ -829,6 +829,14 @@ app.post("/emails/:id/star", async (req, res) => {
   });
 });
 
+// ── POST /emails/:id/unstar ──────────────────────────────────────────────────
+app.post("/emails/:id/unstar", async (req, res) => {
+  const uid = parseInt(req.params.id);
+  await inboxAction(res, async (client) => {
+    await client.messageFlagsRemove(`${uid}`, ["\\Flagged"], { uid: true });
+  });
+});
+
 // ── POST /emails/:id/move ────────────────────────────────────────────────────
 app.post("/emails/:id/move", async (req, res) => {
   const uid = parseInt(req.params.id);
