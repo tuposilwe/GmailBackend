@@ -98,6 +98,79 @@ async function withImap(fn) {
 const logoCache = new Map();
 const LOGO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
 
+// ── In-memory body cache (uid:folder → {data, ts}) ───────────────────────────
+// Prefetch stores fully-parsed email bodies here so /emails/:id is instant.
+const bodyCache = new Map();
+const BODY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h          //  10 * 60 * 1000; // 10 minutes
+
+function bodyCacheKey(uid, folder) {
+  return `${uid}:${folder || "inbox"}`;
+}
+
+function bodyGet(uid, folder) {
+  const entry = bodyCache.get(bodyCacheKey(uid, folder));
+  if (!entry) return null;
+  if (Date.now() - entry.ts > BODY_CACHE_TTL) { bodyCache.delete(bodyCacheKey(uid, folder)); return null; }
+  return entry.data;
+}
+
+function bodySet(uid, folder, data) {
+  bodyCache.set(bodyCacheKey(uid, folder), { data, ts: Date.now() });
+}
+
+// Prefetch bodies for a list of {id, folder} email stubs in the background.
+// Uses a dedicated IMAP connection so it never blocks active requests.
+// Skips any uid already cached. Silently swallows errors.
+async function prefetchBodies(stubs) {
+  const todo = stubs.filter(({ id, folder }) => !bodyGet(id, folder));
+  if (todo.length === 0) return;
+
+  try {
+    await withImap(async (client) => {
+      // Group by folder so we only lock each mailbox once
+      const byFolder = {};
+      for (const { id, folder } of todo) {
+        (byFolder[folder || "inbox"] ??= []).push(id);
+      }
+
+      for (const [folderHint, uids] of Object.entries(byFolder)) {
+        const mailboxPath = await resolveMailbox(client, folderHint).catch(() => null);
+        if (!mailboxPath) continue;
+        const lock = await client.getMailboxLock(mailboxPath).catch(() => null);
+        if (!lock) continue;
+        try {
+          for (const uid of uids) {
+            try {
+              const download = await client.download(`${uid}`, undefined, { uid: true });
+              if (!download?.content) continue;
+              const parsed = await simpleParser(download.content);
+              const fromObj = parsed.from?.value?.[0];
+              const toObj   = parsed.to?.value?.[0];
+              bodySet(uid, folderHint, {
+                id: uid,
+                subject:     parsed.subject || "(No Subject)",
+                senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
+                senderEmail: fromObj?.address || "",
+                toName:      toObj?.name    || toObj?.address?.split("@")[0]  || "",
+                toEmail:     toObj?.address || "",
+                date:        parsed.date?.toISOString() || null,
+                text:        parsed.text || "",
+                html:        parsed.html || "",
+                attachments: (parsed.attachments || []).map((att, i) => ({
+                  index: i,
+                  filename: att.filename || `attachment-${i + 1}`,
+                  contentType: att.contentType || "application/octet-stream",
+                  size: att.size || att.content?.length || 0,
+                })),
+              });
+            } catch { /* skip this uid silently */ }
+          }
+        } finally { lock.release(); }
+      }
+    });
+  } catch { /* prefetch is best-effort */ }
+}
+
 function makeImapClient() {
   const client = new ImapFlow({
     host: process.env.IMAP_SERVER,
@@ -621,7 +694,10 @@ app.get("/emails", async (req, res) => {
           });
         }
       } finally { lock.release(); }
-      res.json({ emails: emails.reverse(), total });
+      const sorted = emails.reverse();
+      res.json({ emails: sorted, total });
+      // Fire-and-forget prefetch of the first 5 emails
+      prefetchBodies(sorted.slice(0, 50).map(e => ({ id: e.id, folder: e.label || "inbox" })));
     });
   } catch (err) {
     console.error("[imap] /emails error:", err.response || err.message);
@@ -737,7 +813,9 @@ app.get("/emails/sent", async (req, res) => {
           });
         }
       } finally { lock.release(); }
-      res.json({ emails: emails.reverse(), total });
+      const sorted = emails.reverse();
+      res.json({ emails: sorted, total });
+      prefetchBodies(sorted.slice(0, 50).map(e => ({ id: e.id, folder: "sent" })));
     });
   } catch (err) {
     console.error("[imap] /emails/sent error:", err.response || err.message);
@@ -899,6 +977,7 @@ app.get("/emails/spam", async (req, res) => {
       } finally { lock.release(); }
       emails.sort((a, b) => new Date(b.date) - new Date(a.date));
       res.json({ emails, total });
+      prefetchBodies(emails.slice(0, 50).map(e => ({ id: e.id, folder: "spam" })));
     });
   } catch (err) {
     console.error("[imap] /emails/spam error:", err.response || err.message);
@@ -943,6 +1022,7 @@ app.get("/emails/trash", async (req, res) => {
       } finally { lock.release(); }
       emails.sort((a, b) => new Date(b.date) - new Date(a.date));
       res.json({ emails, total });
+      prefetchBodies(emails.slice(0, 50).map(e => ({ id: e.id, folder: "trash" })));
     });
   } catch (err) {
     console.error("[imap] /emails/trash error:", err.response || err.message);
@@ -1124,6 +1204,14 @@ app.get("/emails/search", async (req, res) => {
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
   const folderHint = req.query.folder || "inbox";
+
+  // Serve from prefetch cache if available
+  const cached = bodyGet(uid, folderHint);
+  if (cached) {
+    console.log(`[cache] hit uid=${uid} folder=${folderHint}`);
+    return res.json(cached);
+  }
+
   try {
     await withImap(async (client) => {
       const mailboxPath = await resolveMailbox(client, folderHint);
@@ -1134,7 +1222,7 @@ app.get("/emails/:id", async (req, res) => {
         const parsed  = await simpleParser(download.content);
         const fromObj = parsed.from?.value?.[0];
         const toObj   = parsed.to?.value?.[0];
-        res.json({
+        const data = {
           id: uid,
           subject:     parsed.subject || "(No Subject)",
           senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
@@ -1150,7 +1238,9 @@ app.get("/emails/:id", async (req, res) => {
             contentType: att.contentType || "application/octet-stream",
             size: att.size || att.content?.length || 0,
           })),
-        });
+        };
+        bodySet(uid, folderHint, data);
+        res.json(data);
       } finally { lock.release(); }
     });
   } catch (err) {
