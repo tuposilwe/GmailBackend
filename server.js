@@ -27,6 +27,11 @@ db.exec(`
     snooze_until TEXT    NOT NULL,
     PRIMARY KEY (uid, folder)
   );
+  CREATE TABLE IF NOT EXISTS recent_searches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    query      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    searched_at TEXT NOT NULL
+  );
 `);
 
 const upsertContact = db.prepare(`
@@ -1010,6 +1015,112 @@ app.get("/emails/thread", async (req, res) => {
   }
 });
 
+// ── GET /emails/search — search across all folders ───────────────────────────
+app.get("/emails/search", async (req, res) => {
+  const q = (req.query.q || "").trim();
+  const page = parseInt(req.query.page) || 1;
+  const pageSize = 50;
+
+  if (!q) return res.json({ emails: [], total: 0 });
+
+  try {
+    const allResults = [];
+
+    await withImap(async (client) => {
+      // Resolve the real paths for each logical folder using the same helpers
+      // used everywhere else in this server — works for Gmail, Outlook, etc.
+      const [sentPath, draftsPath, trashPath, spamPath] = await Promise.all([
+        findMailbox(client, "\\Sent",   ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"]),
+        findMailbox(client, "\\Drafts", ["Drafts", "[Gmail]/Drafts", "Draft"]),
+        findMailbox(client, "\\Trash",  ["Trash", "[Gmail]/Trash", "Deleted Items"]),
+        findMailbox(client, "\\Junk",   ["Spam", "[Gmail]/Spam", "Junk", "Junk Email"]),
+      ]);
+
+      const foldersToSearch = [
+        { path: "INBOX",   label: "inbox" },
+        sentPath   && { path: sentPath,   label: "sent" },
+        draftsPath && { path: draftsPath, label: "drafts" },
+        trashPath  && { path: trashPath,  label: "trash" },
+        spamPath   && { path: spamPath,   label: "spam" },
+      ].filter(Boolean);
+
+      // Deduplicate in case two entries resolved to the same path
+      const seen = new Set();
+      const uniqueFolders = foldersToSearch.filter(f => { if (seen.has(f.path)) return false; seen.add(f.path); return true; });
+
+      for (const folder of uniqueFolders) {
+        let lock;
+        try {
+          lock = await client.getMailboxLock(folder.path);
+          // TEXT searches everything: subject, from, to, cc, body content
+          const uids = await client.search({ text: q }, { uid: true });
+
+          if (!uids || uids.length === 0) {
+            lock.release();
+            lock = null;
+            continue;
+          }
+
+          for await (const msg of client.fetch(uids, {
+            envelope: true, bodyStructure: true, flags: true,
+            headers: ["authentication-results"],
+            bodyParts: ["text"],
+          }, { uid: true })) {
+            const subject     = msg.envelope.subject || "(No Subject)";
+            const fromObj     = msg.envelope.from?.[0];
+            const senderEmail = fromObj?.address || "unknown@unknown.com";
+            const senderName  = fromObj?.name || senderEmail.split("@")[0];
+            const date        = new Date(msg.envelope.date);
+            const isToday     = date.toDateString() === new Date().toDateString();
+            const timeStr     = isToday
+              ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+              : date.toLocaleDateString([], { month: "short", day: "numeric" });
+            const authRaw     = msg.headers ? msg.headers.toString().replace(/\r?\n[ \t]+/g, " ") : "";
+
+            // Build a plain-text snippet for the preview
+            let bodyText = "";
+            if (msg.bodyParts) {
+              for (const [, buf] of msg.bodyParts) {
+                if (buf) bodyText += buf.toString("utf8");
+              }
+            }
+            // Strip HTML tags and collapse whitespace
+            const plainText = bodyText.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+            const preview   = plainText ? plainText.substring(0, 120) : subject.substring(0, 120);
+
+            allResults.push({
+              id: msg.uid, unread: !msg.flags.has("\\Seen"),
+              starred: msg.flags?.has("\\Flagged"),
+              senderName, senderEmail, sender: senderName,
+              avatar: getInitials(senderName), avatarColor: "#1a73e8",
+              subject, preview,
+              time: timeStr, date: date.toISOString(), label: folder.label,
+              folder: folder.label,
+              verified: /dkim=pass/i.test(authRaw) || /dmarc=pass/i.test(authRaw),
+              attachments: collectAttachments(msg.bodyStructure),
+              hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
+            });
+          }
+        } catch (folderErr) {
+          console.error(`[imap] search: skipping folder ${folder.path}:`, folderErr.message);
+        } finally {
+          if (lock) lock.release();
+        }
+      }
+    });
+
+    // Sort newest first
+    allResults.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    const total = allResults.length;
+    const start = (page - 1) * pageSize;
+    res.json({ emails: allResults.slice(start, start + pageSize), total });
+  } catch (err) {
+    console.error("[imap] /emails/search error:", err.response || err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
+  }
+});
+
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
   const folderHint = req.query.folder || "inbox";
@@ -1340,6 +1451,47 @@ app.get("/contacts", (req, res) => {
   if (!q) return res.json(topContacts.all());
 
   res.json(searchContacts.all({ q: `%${q}%` }));
+});
+
+// ── Recent searches ───────────────────────────────────────────────────────────
+const getRecentSearches = db.prepare(`
+  SELECT query FROM recent_searches
+  ORDER BY searched_at DESC
+  LIMIT 8
+`);
+const upsertRecentSearch = db.prepare(`
+  INSERT INTO recent_searches (query, searched_at)
+  VALUES (@query, @searched_at)
+  ON CONFLICT(query) DO UPDATE SET searched_at = excluded.searched_at
+`);
+const deleteRecentSearch = db.prepare(`
+  DELETE FROM recent_searches WHERE query = @query COLLATE NOCASE
+`);
+const clearRecentSearches = db.prepare(`DELETE FROM recent_searches`);
+
+// GET /recent-searches — return the 8 most recent
+app.get("/recent-searches", (req, res) => {
+  res.json(getRecentSearches.all().map(r => r.query));
+});
+
+// POST /recent-searches — save or bump a search query
+app.post("/recent-searches", (req, res) => {
+  const query = (req.body?.query || "").trim();
+  if (!query) return res.status(400).json({ error: "query required" });
+  upsertRecentSearch.run({ query, searched_at: new Date().toISOString() });
+  res.json({ ok: true });
+});
+
+// DELETE /recent-searches/:query — remove one entry
+app.delete("/recent-searches/:query", (req, res) => {
+  deleteRecentSearch.run({ query: decodeURIComponent(req.params.query) });
+  res.json({ ok: true });
+});
+
+// DELETE /recent-searches — clear all
+app.delete("/recent-searches", (req, res) => {
+  clearRecentSearches.run();
+  res.json({ ok: true });
 });
 
 // ── GET /storage — IMAP quota (used / limit in bytes) ────────────────────────
