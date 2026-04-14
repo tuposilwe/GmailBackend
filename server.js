@@ -945,6 +945,71 @@ app.get("/emails/trash", async (req, res) => {
   }
 });
 
+// ── GET /emails/thread?subject=...  ─────────────────────────────────────────
+// Returns all messages in INBOX + Sent that share the same base subject,
+// sorted oldest-first. Used by the frontend to render threaded conversations.
+app.get("/emails/thread", async (req, res) => {
+  const rawSubject = (req.query.subject || "").trim();
+  if (!rawSubject) return res.json([]);
+  // Strip any number of Re:/Fwd:/Fw:/AW:/WG: prefixes to get the base subject
+  const baseSubject = rawSubject.replace(/^((Re|Fwd?|Fw|AW|WG):\s*)*/gi, "").trim();
+  if (!baseSubject) return res.json([]);
+
+  try {
+    const messages = [];
+
+    await withImap(async (client) => {
+      const fetchFromMailbox = async (mailboxPath, folder) => {
+        const lock = await client.getMailboxLock(mailboxPath);
+        try {
+          const uids = await client.search({ subject: baseSubject }, { uid: true });
+          if (!uids || uids.length === 0) return;
+          for await (const msg of client.fetch(uids, { envelope: true, flags: true }, { uid: true })) {
+            const fromObj = msg.envelope.from?.[0];
+            const toList  = msg.envelope.to || [];
+            const date    = new Date(msg.envelope.date);
+            const isToday = date.toDateString() === new Date().toDateString();
+            const senderEmail = folder === "sent" ? (toList[0]?.address || "") : (fromObj?.address || "");
+            const senderName  = folder === "sent"
+              ? (toList.map(t => t.name || t.address).filter(Boolean).join(", ") || "—")
+              : (fromObj?.name || senderEmail.split("@")[0] || "Unknown");
+            messages.push({
+              id: msg.uid,
+              folder,
+              senderName,
+              senderEmail,
+              subject: msg.envelope.subject || "(No Subject)",
+              date: date.toISOString(),
+              time: isToday
+                ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                : date.toLocaleDateString([], { month: "short", day: "numeric" }),
+              unread: !msg.flags.has("\\Seen"),
+              avatar: getInitials(senderName),
+            });
+          }
+        } finally { lock.release(); }
+      };
+
+      await fetchFromMailbox("INBOX", "inbox");
+      const sentPath = await findMailbox(client, "\\Sent", ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"]);
+      if (sentPath) await fetchFromMailbox(sentPath, "sent");
+    });
+
+    // Deduplicate (same uid+folder) and sort oldest-first
+    const seen = new Set();
+    const unique = messages.filter(m => {
+      const key = `${m.folder}:${m.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    res.json(unique.sort((a, b) => new Date(a.date) - new Date(b.date)));
+  } catch (err) {
+    console.error("[imap] /emails/thread error:", err.response || err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
+  }
+});
+
 app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
   const folderHint = req.query.folder || "inbox";
