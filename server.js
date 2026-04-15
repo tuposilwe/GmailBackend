@@ -747,6 +747,12 @@ app.delete("/logo/cache", (req, res) => {
 
 // ── POST /emails/drafts — save a draft to the IMAP Drafts folder ─────────────
 app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
+  // Capture IMAP creds before any async work — multer's async file parsing
+  // loses the AsyncLocalStorage context (same issue as /send-email).
+  const smtpUser = (process.env.SMTP_USERNAME || "").trim();
+  const imapUser = req.session.imap_user || smtpUser;
+  const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+
   const { to, subject, text, html } = req.body;
 
   // Build the raw RFC 2822 message with nodemailer (no SMTP connection)
@@ -758,7 +764,7 @@ app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
   }));
 
   const info = await builder.sendMail({
-    from:    process.env.SMTP_USERNAME,
+    from:    imapUser,
     to:      to || "",
     subject: subject || "",
     text:    text || "",
@@ -769,7 +775,7 @@ app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
   const rawMessage = info.message; // Buffer
 
   try {
-    await withImap(async (client) => {
+    await withImapCreds(imapUser, imapPass, async (client) => {
       const draftsPath = await findMailbox(client, "\\Drafts", ["Drafts", "[Gmail]/Drafts", "Draft"]);
       if (!draftsPath) return res.status(500).json({ error: "Drafts folder not found" });
       await client.append(draftsPath, rawMessage, ["\\Draft", "\\Seen"]);
