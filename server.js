@@ -1709,6 +1709,27 @@ app.post("/emails/:id/trash", async (req, res) => {
   });
 });
 
+// DELETE /emails/trash — permanently delete all messages in Trash
+app.delete("/emails/trash", async (req, res) => {
+  try {
+    await withImap(async (client) => {
+      const trashPath = await findMailbox(client, "\\Trash", ["Trash", "[Gmail]/Trash", "Deleted Items"]);
+      if (!trashPath) return res.json({ success: true, deleted: 0 });
+      const lock = await client.getMailboxLock(trashPath);
+      try {
+        const mb = await client.mailboxOpen(trashPath);
+        if (mb.exists === 0) return res.json({ success: true, deleted: 0 });
+        await client.messageFlagsAdd("1:*", ["\\Deleted"], { uid: false });
+        await client.mailboxClose(); // expunge on close
+        res.json({ success: true, deleted: mb.exists });
+      } finally { lock.release(); }
+    });
+  } catch (err) {
+    console.error("[imap] DELETE /emails/trash error:", err.response || err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
+  }
+});
+
 // ── POST /emails/:id/restore — move from Trash back to Inbox ─────────────────
 app.post("/emails/:id/restore", async (req, res) => {
   const uid = parseInt(req.params.id);
