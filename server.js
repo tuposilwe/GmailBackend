@@ -32,6 +32,12 @@ db.exec(`
     query      TEXT NOT NULL UNIQUE COLLATE NOCASE,
     searched_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS signatures (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL DEFAULT 'Default',
+    html       TEXT NOT NULL DEFAULT '',
+    is_default INTEGER NOT NULL DEFAULT 0
+  );
 `);
 
 const upsertContact = db.prepare(`
@@ -192,7 +198,7 @@ function makeImapClient() {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // ── GET /logo?domain=example.com ─────────────────────────────────────────────
 // Browser-like UA so external services don't block server-side requests
@@ -1610,6 +1616,52 @@ app.get("/storage", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.response || err.message });
   }
+});
+
+// ── Signature endpoints ───────────────────────────────────────────────────────
+
+// GET /signature — return the default signature (or first one)
+app.get("/signature", (req, res) => {
+  const row = db.prepare(`SELECT id, name, html FROM signatures WHERE is_default = 1 LIMIT 1`).get()
+    || db.prepare(`SELECT id, name, html FROM signatures ORDER BY id ASC LIMIT 1`).get();
+  res.json(row || { id: null, name: "", html: "" });
+});
+
+// GET /signatures — return all signatures
+app.get("/signatures", (req, res) => {
+  const rows = db.prepare(`SELECT id, name, html, is_default FROM signatures ORDER BY id ASC`).all();
+  res.json(rows);
+});
+
+// POST /signature — save (upsert) a signature; body: { id?, name, html, is_default? }
+app.post("/signature", (req, res) => {
+  const { id, name, html, is_default } = req.body || {};
+  if (typeof html !== "string") return res.status(400).json({ error: "html required" });
+  const sigName = name || "Default";
+
+  if (id) {
+    // update existing
+    db.prepare(`UPDATE signatures SET name = ?, html = ?, is_default = ? WHERE id = ?`)
+      .run(sigName, html, is_default ? 1 : 0, id);
+    if (is_default) {
+      db.prepare(`UPDATE signatures SET is_default = 0 WHERE id != ?`).run(id);
+    }
+    return res.json({ ok: true, id });
+  } else {
+    // insert new
+    const info = db.prepare(`INSERT INTO signatures (name, html, is_default) VALUES (?, ?, ?)`)
+      .run(sigName, html, is_default ? 1 : 0);
+    if (is_default) {
+      db.prepare(`UPDATE signatures SET is_default = 0 WHERE id != ?`).run(info.lastInsertRowid);
+    }
+    return res.json({ ok: true, id: info.lastInsertRowid });
+  }
+});
+
+// DELETE /signature/:id — delete a signature
+app.delete("/signature/:id", (req, res) => {
+  db.prepare(`DELETE FROM signatures WHERE id = ?`).run(req.params.id);
+  res.json({ ok: true });
 });
 
 // console.log(`Your port is ${process.env.PORT}`); // 8626
