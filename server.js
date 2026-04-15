@@ -7,6 +7,7 @@ var Database = require("better-sqlite3");
 var path = require("path");
 var multer = require("multer");
 var crypto = require("crypto");
+var cookieParser = require("cookie-parser");
 require('dotenv').config();
 
 // multer: keep files in memory so we can pass buffers directly to nodemailer
@@ -37,6 +38,12 @@ db.exec(`
     name       TEXT NOT NULL DEFAULT 'Default',
     html       TEXT NOT NULL DEFAULT '',
     is_default INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    email      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
   );
 `);
 
@@ -197,8 +204,100 @@ function makeImapClient() {
 }
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "10mb" }));
+app.use(cookieParser());
+
+// ── Session helpers ───────────────────────────────────────────────────────────
+const SESSION_TTL_DAYS = 7;
+
+function createSession(email) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expires = new Date(now.getTime() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+  db.prepare(`INSERT INTO sessions (token, email, created_at, expires_at) VALUES (?, ?, ?, ?)`)
+    .run(token, email, now.toISOString(), expires.toISOString());
+  return { token, expires };
+}
+
+function getSession(token) {
+  if (!token) return null;
+  const row = db.prepare(`SELECT * FROM sessions WHERE token = ?`).get(token);
+  if (!row) return null;
+  if (new Date(row.expires_at) < new Date()) {
+    db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+    return null;
+  }
+  return row;
+}
+
+function requireAuth(req, res, next) {
+  const token = req.cookies?.session;
+  const session = getSession(token);
+  if (!session) return res.status(401).json({ error: "Unauthorized" });
+  req.session = session;
+  next();
+}
+
+// ── Auth endpoints (public — no requireAuth) ──────────────────────────────────
+
+// POST /auth/login — validate credentials by testing IMAP connection
+app.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+
+  // Validate against configured IMAP credentials
+  const configEmail = (process.env.IMAP_USERNAME || "").trim().toLowerCase();
+  const configPass  = (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+
+  if (email.trim().toLowerCase() !== configEmail) {
+    return res.status(401).json({ error: "Invalid email or password" });
+  }
+
+  // Try connecting to IMAP to verify the password is correct
+  const testClient = new ImapFlow({
+    host: process.env.IMAP_SERVER,
+    port: parseInt(process.env.IMAP_PORT),
+    secure: true,
+    auth: { user: email.trim(), pass: password.replace(/\s/g, "") },
+    logger: false,
+  });
+
+  try {
+    await testClient.connect();
+    await testClient.logout();
+  } catch {
+    return res.status(401).json({ error: "Invalid email or password" });
+  }
+
+  const { token, expires } = createSession(email.trim().toLowerCase());
+  res.cookie("session", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    expires,
+    path: "/",
+  });
+  res.json({ ok: true, email: email.trim().toLowerCase() });
+});
+
+// POST /auth/logout
+app.post("/auth/logout", (req, res) => {
+  const token = req.cookies?.session;
+  if (token) db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+  res.clearCookie("session", { path: "/" });
+  res.json({ ok: true });
+});
+
+// GET /auth/me — check current session
+app.get("/auth/me", (req, res) => {
+  const token = req.cookies?.session;
+  const session = getSession(token);
+  if (!session) return res.status(401).json({ error: "Unauthorized" });
+  res.json({ email: session.email });
+});
+
+// ── Apply auth middleware to all subsequent routes ────────────────────────────
+app.use(requireAuth);
 
 // ── GET /logo?domain=example.com ─────────────────────────────────────────────
 // Browser-like UA so external services don't block server-side requests
