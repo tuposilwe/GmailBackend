@@ -804,7 +804,7 @@ function extractInlineImages(html) {
 }
 
 app.post("/send-email", upload.array("attachments"), async (req, res) => {
-  const { to, subject, text, html: rawHtml } = req.body;
+  const { to, cc, bcc, subject, text, html: rawHtml } = req.body;
 
   const smtpUser = (process.env.SMTP_USERNAME || "").trim();
   const smtpPass = (process.env.SMTP_PASSWORD || "").replace(/\s/g, "");
@@ -830,6 +830,8 @@ app.post("/send-email", upload.array("attachments"), async (req, res) => {
   const mailOptions = {
     from: fromField,
     to,
+    ...(cc ? { cc } : {}),
+    ...(bcc ? { bcc } : {}),
     subject,
     text: text || "",
     ...(html ? { html } : {}),
