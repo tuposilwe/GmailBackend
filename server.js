@@ -8,7 +8,48 @@ var path = require("path");
 var multer = require("multer");
 var crypto = require("crypto");
 var cookieParser = require("cookie-parser");
-require('dotenv').config();
+var { AsyncLocalStorage } = require("async_hooks");
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+// Propagates the logged-in user's IMAP credentials through async call chains
+// so makeImapClient() always uses the right account without changing call sites.
+const imapCredsStore = new AsyncLocalStorage();
+
+// ── AES-256-GCM encryption for stored passwords ───────────────────────────────
+// Derive a 32-byte key from SESSION_SECRET (or generate a random one at startup
+// as a fallback — note: a random key means passwords can't survive a restart,
+// so set SESSION_SECRET in .env for persistence).
+const _rawSecret = process.env.SESSION_SECRET || "";
+const ENCRYPT_KEY = _rawSecret
+  ? crypto.createHash("sha256").update(_rawSecret).digest() // 32 bytes
+  : crypto.randomBytes(32);
+
+if (!process.env.SESSION_SECRET) {
+  console.warn("[security] SESSION_SECRET not set — using a random key. Stored passwords will be unreadable after restart. Add SESSION_SECRET to .env.");
+}
+
+function encrypt(plaintext) {
+  const iv = crypto.randomBytes(12); // 96-bit IV for GCM
+  const cipher = crypto.createCipheriv("aes-256-gcm", ENCRYPT_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag(); // 16-byte authentication tag
+  // Store as hex: iv.encrypted.tag  (all separated by ".")
+  return `${iv.toString("hex")}.${encrypted.toString("hex")}.${tag.toString("hex")}`;
+}
+
+function decrypt(stored) {
+  try {
+    const [ivHex, dataHex, tagHex] = stored.split(".");
+    const iv = Buffer.from(ivHex, "hex");
+    const data = Buffer.from(dataHex, "hex");
+    const tag = Buffer.from(tagHex, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", ENCRYPT_KEY, iv);
+    decipher.setAuthTag(tag);
+    return decipher.update(data, undefined, "utf8") + decipher.final("utf8");
+  } catch {
+    return ""; // tampered or from a different key
+  }
+}
 
 // multer: keep files in memory so we can pass buffers directly to nodemailer
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
@@ -43,16 +84,22 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
     token      TEXT PRIMARY KEY,
     email      TEXT NOT NULL,
+    imap_user  TEXT NOT NULL DEFAULT '',
+    imap_pass  TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
   );
 `);
 
 // ── Migrations ────────────────────────────────────────────────────────────────
-// Add user_email column to signatures if it doesn't exist yet (one-time migration)
 const sigCols = db.prepare(`PRAGMA table_info(signatures)`).all().map(c => c.name);
 if (!sigCols.includes("user_email")) {
   db.exec(`ALTER TABLE signatures ADD COLUMN user_email TEXT NOT NULL DEFAULT ''`);
+}
+const sesCols = db.prepare(`PRAGMA table_info(sessions)`).all().map(c => c.name);
+if (!sesCols.includes("imap_user")) {
+  db.exec(`ALTER TABLE sessions ADD COLUMN imap_user TEXT NOT NULL DEFAULT ''`);
+  db.exec(`ALTER TABLE sessions ADD COLUMN imap_pass TEXT NOT NULL DEFAULT ''`);
 }
 
 const upsertContact = db.prepare(`
@@ -193,13 +240,14 @@ async function prefetchBodies(stubs) {
 }
 
 function makeImapClient() {
+  const creds = imapCredsStore.getStore();
   const client = new ImapFlow({
-    host: process.env.IMAP_SERVER,
-    port: parseInt(process.env.IMAP_PORT),
+    host: (process.env.IMAP_SERVER || "").trim(),
+    port: parseInt(process.env.IMAP_PORT) || 993,
     secure: true,
     auth: {
-      user: process.env.IMAP_USERNAME,
-      pass: process.env.IMAP_PASSWORD.replace(/\s/g, "")
+      user: creds?.user || (process.env.IMAP_USERNAME || "").trim(),
+      pass: creds?.pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, ""),
     },
     logger: false
   });
@@ -219,12 +267,12 @@ app.use(cookieParser());
 // ── Session helpers ───────────────────────────────────────────────────────────
 const SESSION_TTL_DAYS = 7;
 
-function createSession(email) {
+function createSession(email, imapUser, imapPass) {
   const token = crypto.randomBytes(32).toString("hex");
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
-  db.prepare(`INSERT INTO sessions (token, email, created_at, expires_at) VALUES (?, ?, ?, ?)`)
-    .run(token, email, now.toISOString(), expires.toISOString());
+  db.prepare(`INSERT INTO sessions (token, email, imap_user, imap_pass, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(token, email, imapUser, encrypt(imapPass), now.toISOString(), expires.toISOString());
   return { token, expires };
 }
 
@@ -236,7 +284,8 @@ function getSession(token) {
     db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
     return null;
   }
-  return row;
+  // Decrypt the password so requireAuth can pass plaintext to makeImapClient
+  return { ...row, imap_pass: decrypt(row.imap_pass) };
 }
 
 function requireAuth(req, res, next) {
@@ -244,7 +293,9 @@ function requireAuth(req, res, next) {
   const session = getSession(token);
   if (!session) return res.status(401).json({ error: "Unauthorized" });
   req.session = session;
-  next();
+  // Run the rest of the request inside the IMAP credential context so
+  // makeImapClient() automatically uses this user's credentials.
+  imapCredsStore.run({ user: session.imap_user, pass: session.imap_pass }, next);
 }
 
 // ── Auth endpoints (public — no requireAuth) ──────────────────────────────────
@@ -255,12 +306,12 @@ app.post("/auth/login", async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
   // Validate against configured IMAP credentials
-  const configEmail = (process.env.IMAP_USERNAME || "").trim().toLowerCase();
-  const configPass  = (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+  // const configEmail = (process.env.IMAP_USERNAME || "").trim().toLowerCase();
+  // const configPass  = (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
 
-  if (email.trim().toLowerCase() !== configEmail) {
-    return res.status(401).json({ error: "Invalid email or password" });
-  }
+  // if (email.trim().toLowerCase() !== configEmail) {
+  //   return res.status(401).json({ error: "Invalid email or password" });
+  // }
 
   // Try connecting to IMAP to verify the password is correct
   const testClient = new ImapFlow({
@@ -278,7 +329,9 @@ app.post("/auth/login", async (req, res) => {
     return res.status(401).json({ error: "Invalid email or password" });
   }
 
-  const { token, expires } = createSession(email.trim().toLowerCase());
+  const imapUser = email.trim().toLowerCase();
+  const imapPass = password.replace(/\s/g, "");
+  const { token, expires } = createSession(imapUser, imapUser, imapPass);
   res.cookie("session", token, {
     httpOnly: true,
     sameSite: "lax",
