@@ -35,6 +35,7 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS signatures (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT NOT NULL DEFAULT '',
     name       TEXT NOT NULL DEFAULT 'Default',
     html       TEXT NOT NULL DEFAULT '',
     is_default INTEGER NOT NULL DEFAULT 0
@@ -46,6 +47,13 @@ db.exec(`
     expires_at TEXT NOT NULL
   );
 `);
+
+// ── Migrations ────────────────────────────────────────────────────────────────
+// Add user_email column to signatures if it doesn't exist yet (one-time migration)
+const sigCols = db.prepare(`PRAGMA table_info(signatures)`).all().map(c => c.name);
+if (!sigCols.includes("user_email")) {
+  db.exec(`ALTER TABLE signatures ADD COLUMN user_email TEXT NOT NULL DEFAULT ''`);
+}
 
 const upsertContact = db.prepare(`
   INSERT INTO sent_contacts (email, name, sent_count, last_sent)
@@ -1719,47 +1727,50 @@ app.get("/storage", async (req, res) => {
 
 // ── Signature endpoints ───────────────────────────────────────────────────────
 
-// GET /signature — return the default signature (or first one)
+// GET /signature — return the default signature for the logged-in user (or first one)
 app.get("/signature", (req, res) => {
-  const row = db.prepare(`SELECT id, name, html FROM signatures WHERE is_default = 1 LIMIT 1`).get()
-    || db.prepare(`SELECT id, name, html FROM signatures ORDER BY id ASC LIMIT 1`).get();
+  const email = req.session.email;
+  const row = db.prepare(`SELECT id, name, html FROM signatures WHERE user_email = ? AND is_default = 1 LIMIT 1`).get(email)
+    || db.prepare(`SELECT id, name, html FROM signatures WHERE user_email = ? ORDER BY id ASC LIMIT 1`).get(email);
   res.json(row || { id: null, name: "", html: "" });
 });
 
-// GET /signatures — return all signatures
+// GET /signatures — return all signatures for the logged-in user
 app.get("/signatures", (req, res) => {
-  const rows = db.prepare(`SELECT id, name, html, is_default FROM signatures ORDER BY id ASC`).all();
+  const email = req.session.email;
+  const rows = db.prepare(`SELECT id, name, html, is_default FROM signatures WHERE user_email = ? ORDER BY id ASC`).all(email);
   res.json(rows);
 });
 
-// POST /signature — save (upsert) a signature; body: { id?, name, html, is_default? }
+// POST /signature — save (upsert) a signature for the logged-in user
 app.post("/signature", (req, res) => {
+  const email = req.session.email;
   const { id, name, html, is_default } = req.body || {};
   if (typeof html !== "string") return res.status(400).json({ error: "html required" });
   const sigName = name || "Default";
 
   if (id) {
-    // update existing
-    db.prepare(`UPDATE signatures SET name = ?, html = ?, is_default = ? WHERE id = ?`)
-      .run(sigName, html, is_default ? 1 : 0, id);
+    // update existing — only if it belongs to this user
+    db.prepare(`UPDATE signatures SET name = ?, html = ?, is_default = ? WHERE id = ? AND user_email = ?`)
+      .run(sigName, html, is_default ? 1 : 0, id, email);
     if (is_default) {
-      db.prepare(`UPDATE signatures SET is_default = 0 WHERE id != ?`).run(id);
+      db.prepare(`UPDATE signatures SET is_default = 0 WHERE user_email = ? AND id != ?`).run(email, id);
     }
     return res.json({ ok: true, id });
   } else {
     // insert new
-    const info = db.prepare(`INSERT INTO signatures (name, html, is_default) VALUES (?, ?, ?)`)
-      .run(sigName, html, is_default ? 1 : 0);
+    const info = db.prepare(`INSERT INTO signatures (user_email, name, html, is_default) VALUES (?, ?, ?, ?)`)
+      .run(email, sigName, html, is_default ? 1 : 0);
     if (is_default) {
-      db.prepare(`UPDATE signatures SET is_default = 0 WHERE id != ?`).run(info.lastInsertRowid);
+      db.prepare(`UPDATE signatures SET is_default = 0 WHERE user_email = ? AND id != ?`).run(email, info.lastInsertRowid);
     }
     return res.json({ ok: true, id: info.lastInsertRowid });
   }
 });
 
-// DELETE /signature/:id — delete a signature
+// DELETE /signature/:id — delete a signature (only if it belongs to this user)
 app.delete("/signature/:id", (req, res) => {
-  db.prepare(`DELETE FROM signatures WHERE id = ?`).run(req.params.id);
+  db.prepare(`DELETE FROM signatures WHERE id = ? AND user_email = ?`).run(req.params.id, req.session.email);
   res.json({ ok: true });
 });
 
