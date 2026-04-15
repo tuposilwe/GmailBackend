@@ -89,10 +89,6 @@ db.exec(`
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS user_settings (
-    user_email   TEXT PRIMARY KEY COLLATE NOCASE,
-    display_name TEXT NOT NULL DEFAULT ''
-  );
 `);
 
 // ── Migrations ────────────────────────────────────────────────────────────────
@@ -818,9 +814,7 @@ app.post("/send-email", upload.array("attachments"), async (req, res) => {
   const imapUser = req.session.imap_user || smtpUser;
   const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
 
-  const settings = db.prepare(`SELECT display_name FROM user_settings WHERE user_email = ?`).get(req.session.email);
-  const displayName = settings?.display_name?.trim();
-  const fromField = displayName ? `"${displayName}" <${imapUser}>` : imapUser;
+  const fromField = imapUser;
 
   // Convert base64 inline images to CID attachments to keep message body small
   const { html, cidAttachments } = extractInlineImages(rawHtml);
@@ -1952,21 +1946,5 @@ app.get("/debug/mailboxes", async (req, res) => {
 });
 
 // ── User settings endpoints ───────────────────────────────────────────────────
-
-// GET /user-settings — return settings for the logged-in user
-app.get("/user-settings", (req, res) => {
-  const row = db.prepare(`SELECT display_name FROM user_settings WHERE user_email = ?`).get(req.session.email);
-  res.json({ display_name: row?.display_name || "" });
-});
-
-// POST /user-settings — save settings for the logged-in user
-app.post("/user-settings", (req, res) => {
-  const { display_name } = req.body || {};
-  db.prepare(`
-    INSERT INTO user_settings (user_email, display_name) VALUES (?, ?)
-    ON CONFLICT(user_email) DO UPDATE SET display_name = excluded.display_name
-  `).run(req.session.email, display_name || "");
-  res.json({ ok: true });
-});
 
 app.listen(process.env.PORT || 3000, () => console.log(`Server running on port ${process.env.PORT}`));
