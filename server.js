@@ -89,6 +89,10 @@ db.exec(`
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS user_settings (
+    user_email   TEXT PRIMARY KEY COLLATE NOCASE,
+    display_name TEXT NOT NULL DEFAULT ''
+  );
 `);
 
 // ── Migrations ────────────────────────────────────────────────────────────────
@@ -153,6 +157,29 @@ function _imapRelease() {
 async function withImap(fn) {
   await _imapAcquire();
   const client = makeImapClient();
+  try {
+    await client.connect();
+    return await fn(client);
+  } finally {
+    _imapRelease();
+    client.logout().catch(() => {});
+  }
+}
+
+// Like withImap but uses explicit credentials instead of AsyncLocalStorage.
+// Use this when the store context may be lost (e.g. after nodemailer callbacks).
+async function withImapCreds(user, pass, fn) {
+  await _imapAcquire();
+  const client = new ImapFlow({
+    host: (process.env.IMAP_SERVER || "").trim(),
+    port: parseInt(process.env.IMAP_PORT) || 993,
+    secure: true,
+    auth: { user, pass },
+    logger: false,
+  });
+  client.on("error", (err) => {
+    console.error("[imap] socket error:", err.response || err.message);
+  });
   try {
     await client.connect();
     return await fn(client);
@@ -758,33 +785,101 @@ app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
   }
 });
 
-app.post("/send-email", upload.array("attachments"), async (req, res) => {
-  const { to, subject, text, html } = req.body;
-
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_SERVER,
-    port: process.env.SMTP_PORT,
-    secure: true,
-    auth: {
-      user: process.env.SMTP_USERNAME,
-      pass: process.env.SMTP_PASSWORD
+// Extract base64 data: URIs from HTML and replace them with cid: references.
+// Returns { html, cidAttachments } where cidAttachments are nodemailer-ready
+// embedded image objects. This keeps the message body small so Gmail doesn't clip it.
+function extractInlineImages(html) {
+  const cidAttachments = [];
+  const replaced = (html || "").replace(
+    /src="data:([^;]+);base64,([^"]+)"/g,
+    (_, mimeType, b64) => {
+      const cid = `img_${crypto.randomBytes(8).toString("hex")}@mail`;
+      const ext = mimeType.split("/")[1]?.split("+")[0] || "bin";
+      cidAttachments.push({
+        filename: `image.${ext}`,
+        content: Buffer.from(b64, "base64"),
+        contentType: mimeType,
+        cid,
+      });
+      return `src="cid:${cid}"`;
     }
-  });
+  );
+  return { html: replaced, cidAttachments };
+}
 
-  const attachments = (req.files || []).map(f => ({
+app.post("/send-email", upload.array("attachments"), async (req, res) => {
+  const { to, subject, text, html: rawHtml } = req.body;
+
+  const smtpUser = (process.env.SMTP_USERNAME || "").trim();
+  const smtpPass = (process.env.SMTP_PASSWORD || "").replace(/\s/g, "");
+
+  // Capture IMAP credentials now — AsyncLocalStorage context can be lost
+  // after nodemailer's internal stream callbacks, so we hold them explicitly.
+  const imapUser = req.session.imap_user || smtpUser;
+  const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+
+  const settings = db.prepare(`SELECT display_name FROM user_settings WHERE user_email = ?`).get(req.session.email);
+  const displayName = settings?.display_name?.trim();
+  const fromField = displayName ? `"${displayName}" <${imapUser}>` : imapUser;
+
+  // Convert base64 inline images to CID attachments to keep message body small
+  const { html, cidAttachments } = extractInlineImages(rawHtml);
+
+  const fileAttachments = (req.files || []).map(f => ({
     filename: f.originalname,
     content:  f.buffer,
     contentType: f.mimetype,
   }));
 
-  await transporter.sendMail({
-    from: process.env.SMTP_USERNAME,
+  const attachments = [...fileAttachments, ...cidAttachments];
+
+  const mailOptions = {
+    from: fromField,
     to,
     subject,
     text: text || "",
     ...(html ? { html } : {}),
     ...(attachments.length ? { attachments } : {}),
+  };
+
+  // 1. Send via SMTP
+  const transporter = nodemailer.createTransport({
+    host: (process.env.SMTP_SERVER || "").trim(),
+    port: parseInt(process.env.SMTP_PORT) || 465,
+    secure: true,
+    auth: { user: smtpUser, pass: smtpPass },
   });
+
+  try {
+    await transporter.sendMail(mailOptions);
+  } catch (err) {
+    console.error("SMTP send error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+
+  // 2. Build raw RFC 2822 message and append to IMAP Sent folder
+  try {
+    const builder = nodemailer.createTransport({ streamTransport: true, buffer: true });
+    const info = await builder.sendMail(mailOptions);
+    const rawMessage = info.message;
+
+    await withImapCreds(imapUser, imapPass, async (client) => {
+      const sentPath = await findMailbox(client, "\\Sent", [
+        "Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail",
+        "INBOX.Sent", "INBOX.Sent Items",
+      ]);
+      if (!sentPath) {
+        console.warn("[imap] Sent folder not found — cannot save to Sent");
+        return;
+      }
+      console.log("[imap] Appending to Sent folder:", sentPath);
+      await client.append(sentPath, rawMessage, ["\\Seen"]);
+      console.log("[imap] Successfully appended to Sent folder");
+    });
+  } catch (err) {
+    // Don't fail the request — email was already sent successfully via SMTP
+    console.error("[imap] append to Sent error:", err.response || err.message);
+  }
 
   res.json({ success: true });
 });
@@ -1445,12 +1540,29 @@ app.get("/emails/:id/attachments/:index", async (req, res) => {
 // ── Helper: find a special-use mailbox path ──────────────────────────────────
 async function findMailbox(client, specialUse, fallbackNames = []) {
   const list = await client.list();
+
+  // 1. Match by IMAP special-use attribute (most reliable)
   let mb = list.find(m => m.specialUse === specialUse);
   if (mb) return mb.path;
+
+  // 2. Match by exact path or name (case-insensitive) from fallback list
   for (const name of fallbackNames) {
-    mb = list.find(m => m.path === name || m.name === name);
+    mb = list.find(
+      m => m.path.toLowerCase() === name.toLowerCase()
+        || m.name.toLowerCase() === name.toLowerCase()
+    );
     if (mb) return mb.path;
   }
+
+  // 3. Partial match — handles cPanel INBOX.Sent, INBOX.Drafts etc.
+  const keyword = specialUse.replace("\\", "").toLowerCase(); // e.g. "sent", "drafts"
+  mb = list.find(m =>
+    m.path.toLowerCase().includes(keyword) ||
+    m.name.toLowerCase().includes(keyword)
+  );
+  if (mb) return mb.path;
+
+  console.warn(`[imap] Could not find mailbox for ${specialUse}. Available:`, list.map(m => m.path));
   return null;
 }
 
@@ -1827,6 +1939,34 @@ app.delete("/signature/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-// console.log(`Your port is ${process.env.PORT}`); // 8626
+// ── GET /debug/mailboxes — list all IMAP folders (for troubleshooting) ───────
+app.get("/debug/mailboxes", async (req, res) => {
+  try {
+    await withImap(async (client) => {
+      const list = await client.list();
+      res.json(list.map(m => ({ path: m.path, name: m.name, specialUse: m.specialUse || null })));
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── User settings endpoints ───────────────────────────────────────────────────
+
+// GET /user-settings — return settings for the logged-in user
+app.get("/user-settings", (req, res) => {
+  const row = db.prepare(`SELECT display_name FROM user_settings WHERE user_email = ?`).get(req.session.email);
+  res.json({ display_name: row?.display_name || "" });
+});
+
+// POST /user-settings — save settings for the logged-in user
+app.post("/user-settings", (req, res) => {
+  const { display_name } = req.body || {};
+  db.prepare(`
+    INSERT INTO user_settings (user_email, display_name) VALUES (?, ?)
+    ON CONFLICT(user_email) DO UPDATE SET display_name = excluded.display_name
+  `).run(req.session.email, display_name || "");
+  res.json({ ok: true });
+});
 
 app.listen(process.env.PORT || 3000, () => console.log(`Server running on port ${process.env.PORT}`));
