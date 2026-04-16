@@ -218,7 +218,6 @@ async function prefetchBodies(stubs) {
 
   try {
     await withImap(async (client) => {
-      // Group by folder so we only lock each mailbox once
       const byFolder = {};
       for (const { id, folder } of todo) {
         (byFolder[folder || "inbox"] ??= []).push(id);
@@ -236,17 +235,27 @@ async function prefetchBodies(stubs) {
               if (!download?.content) continue;
               const parsed = await simpleParser(download.content);
               const fromObj = parsed.from?.value?.[0];
-              const toObj   = parsed.to?.value?.[0];
+              const toObj = parsed.to?.value?.[0];
+              const ccList = (parsed.cc?.value || []).map(cc => ({
+                name: cc.name || cc.address?.split("@")[0] || "",
+                email: cc.address || ""
+              }));
+              const bccList = (parsed.bcc?.value || []).map(bcc => ({
+                name: bcc.name || bcc.address?.split("@")[0] || "",
+                email: bcc.address || ""
+              }));
               bodySet(uid, folderHint, {
                 id: uid,
-                subject:     parsed.subject || "(No Subject)",
-                senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
+                subject: parsed.subject || "(No Subject)",
+                senderName: fromObj?.name || fromObj?.address?.split("@")[0] || "Unknown",
                 senderEmail: fromObj?.address || "",
-                toName:      toObj?.name    || toObj?.address?.split("@")[0]  || "",
-                toEmail:     toObj?.address || "",
-                date:        parsed.date?.toISOString() || null,
-                text:        parsed.text || "",
-                html:        parsed.html || "",
+                toName: toObj?.name || toObj?.address?.split("@")[0] || "",
+                toEmail: toObj?.address || "",
+                cc: ccList,
+                bcc: bccList,
+                date: parsed.date?.toISOString() || null,
+                text: parsed.text || "",
+                html: parsed.html || "",
                 attachments: (parsed.attachments || []).map((att, i) => ({
                   index: i,
                   filename: att.filename || `attachment-${i + 1}`,
@@ -1468,7 +1477,6 @@ app.get("/emails/:id", async (req, res) => {
   const uid = parseInt(req.params.id);
   const folderHint = req.query.folder || "inbox";
 
-  // Serve from prefetch cache if available
   const cached = bodyGet(uid, folderHint);
   if (cached) {
     console.log(`[cache] hit uid=${uid} folder=${folderHint}`);
@@ -1482,19 +1490,32 @@ app.get("/emails/:id", async (req, res) => {
       try {
         const download = await client.download(`${uid}`, undefined, { uid: true });
         if (!download || !download.content) return res.status(404).json({ error: "Message not found" });
-        const parsed  = await simpleParser(download.content);
+        const parsed = await simpleParser(download.content);
         const fromObj = parsed.from?.value?.[0];
-        const toObj   = parsed.to?.value?.[0];
+        const toObj = parsed.to?.value?.[0];
+        
+        // Extract CC and BCC recipients
+        const ccList = (parsed.cc?.value || []).map(cc => ({
+          name: cc.name || cc.address?.split("@")[0] || "",
+          email: cc.address || ""
+        }));
+        const bccList = (parsed.bcc?.value || []).map(bcc => ({
+          name: bcc.name || bcc.address?.split("@")[0] || "",
+          email: bcc.address || ""
+        }));
+        
         const data = {
           id: uid,
-          subject:     parsed.subject || "(No Subject)",
-          senderName:  fromObj?.name  || fromObj?.address?.split("@")[0] || "Unknown",
+          subject: parsed.subject || "(No Subject)",
+          senderName: fromObj?.name || fromObj?.address?.split("@")[0] || "Unknown",
           senderEmail: fromObj?.address || "",
-          toName:      toObj?.name    || toObj?.address?.split("@")[0]  || "",
-          toEmail:     toObj?.address || "",
-          date:        parsed.date?.toISOString() || null,
-          text:        parsed.text || "",
-          html:        parsed.html || "",
+          toName: toObj?.name || toObj?.address?.split("@")[0] || "",
+          toEmail: toObj?.address || "",
+          cc: ccList,
+          bcc: bccList,
+          date: parsed.date?.toISOString() || null,
+          text: parsed.text || "",
+          html: parsed.html || "",
           attachments: (parsed.attachments || []).map((att, i) => ({
             index: i,
             filename: att.filename || `attachment-${i + 1}`,
