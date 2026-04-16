@@ -145,3 +145,4 @@ vite.config.ts.timestamp-*
 
 *.sqlite3
 *.db
+/generated/prisma

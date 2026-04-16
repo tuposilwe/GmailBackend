@@ -1,15 +1,21 @@
-var express = require("express");
-var cors = require("cors");
-var nodemailer = require("nodemailer");
-var { ImapFlow } = require("imapflow");
-var { simpleParser } = require("mailparser");
-var Database = require("better-sqlite3");
-var path = require("path");
-var multer = require("multer");
-var crypto = require("crypto");
-var cookieParser = require("cookie-parser");
-var { AsyncLocalStorage } = require("async_hooks");
+const express = require("express");
+const cors = require("cors");
+const nodemailer = require("nodemailer");
+const { ImapFlow } = require("imapflow");
+const { simpleParser } = require("mailparser");
+const path = require("path");
+const multer = require("multer");
+const crypto = require("crypto");
+const cookieParser = require("cookie-parser");
+const { AsyncLocalStorage } = require("async_hooks");
+const { PrismaClient } = require('@prisma/client');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+// Initialize Prisma Client
+// const prisma = new PrismaClient();
+const prisma = new PrismaClient({
+  log: ['query', 'info', 'warn', 'error'],
+});
 
 // Propagates the logged-in user's IMAP credentials through async call chains
 // so makeImapClient() always uses the right account without changing call sites.
@@ -54,137 +60,6 @@ function decrypt(stored) {
 // multer: keep files in memory so we can pass buffers directly to nodemailer
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// ── SQLite – contacts + snoozed ───────────────────────────────────────────────
-const db = new Database(path.join(__dirname, "contacts.db"));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sent_contacts (
-    email TEXT PRIMARY KEY COLLATE NOCASE,
-    name  TEXT NOT NULL,
-    sent_count INTEGER NOT NULL DEFAULT 1,
-    last_sent  TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS snoozed (
-    uid          INTEGER NOT NULL,
-    folder       TEXT    NOT NULL DEFAULT 'inbox',
-    snooze_until TEXT    NOT NULL,
-    PRIMARY KEY (uid, folder)
-  );
-  CREATE TABLE IF NOT EXISTS recent_searches (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    query      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    searched_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS signatures (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_email TEXT NOT NULL DEFAULT '',
-    name       TEXT NOT NULL DEFAULT 'Default',
-    html       TEXT NOT NULL DEFAULT '',
-    is_default INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    token      TEXT PRIMARY KEY,
-    email      TEXT NOT NULL,
-    imap_user  TEXT NOT NULL DEFAULT '',
-    imap_pass  TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-  );
-`);
-
-// ── Migrations ────────────────────────────────────────────────────────────────
-const sigCols = db.prepare(`PRAGMA table_info(signatures)`).all().map(c => c.name);
-if (!sigCols.includes("user_email")) {
-  db.exec(`ALTER TABLE signatures ADD COLUMN user_email TEXT NOT NULL DEFAULT ''`);
-}
-const sesCols = db.prepare(`PRAGMA table_info(sessions)`).all().map(c => c.name);
-if (!sesCols.includes("imap_user")) {
-  db.exec(`ALTER TABLE sessions ADD COLUMN imap_user TEXT NOT NULL DEFAULT ''`);
-  db.exec(`ALTER TABLE sessions ADD COLUMN imap_pass TEXT NOT NULL DEFAULT ''`);
-}
-
-const upsertContact = db.prepare(`
-  INSERT INTO sent_contacts (email, name, sent_count, last_sent)
-  VALUES (@email, @name, 1, @last_sent)
-  ON CONFLICT(email) DO UPDATE SET
-    name       = excluded.name,
-    sent_count = sent_contacts.sent_count + 1,
-    last_sent  = excluded.last_sent
-`);
-
-const searchContacts = db.prepare(`
-  SELECT name, email FROM sent_contacts
-  WHERE lower(email) LIKE lower(@q) OR lower(name) LIKE lower(@q)
-  ORDER BY sent_count DESC, last_sent DESC
-  LIMIT 10
-`);
-
-const topContacts = db.prepare(`
-  SELECT name, email FROM sent_contacts
-  ORDER BY sent_count DESC, last_sent DESC
-  LIMIT 50
-`);
-
-const upsertSnooze       = db.prepare(`INSERT INTO snoozed (uid, folder, snooze_until) VALUES (@uid, @folder, @snooze_until) ON CONFLICT(uid, folder) DO UPDATE SET snooze_until = excluded.snooze_until`);
-const deleteSnooze       = db.prepare(`DELETE FROM snoozed WHERE uid = ? AND folder = ?`);
-const getActiveSnoozed   = db.prepare(`SELECT uid, folder, snooze_until FROM snoozed WHERE snooze_until > ? ORDER BY snooze_until ASC`);
-const deleteExpiredSnooze = db.prepare(`DELETE FROM snoozed WHERE snooze_until <= ?`);
-
-// ── IMAP connection semaphore ─────────────────────────────────────────────────
-// Gmail caps simultaneous IMAP connections (~15). Concurrent React Query
-// fetches (inbox list, drafts badge, email detail…) can easily exceed this.
-// Limit to 3 concurrent connections and queue the rest.
-const IMAP_CONCURRENCY = 3;
-let _imapSlots = IMAP_CONCURRENCY;
-const _imapQueue = [];
-
-function _imapAcquire() {
-  return new Promise(resolve => {
-    if (_imapSlots > 0) { _imapSlots--; resolve(); }
-    else { _imapQueue.push(resolve); }
-  });
-}
-
-function _imapRelease() {
-  if (_imapQueue.length > 0) { _imapQueue.shift()(); }
-  else { _imapSlots++; }
-}
-
-// Run fn(client) with a connected client, always releasing the slot on exit.
-async function withImap(fn) {
-  await _imapAcquire();
-  const client = makeImapClient();
-  try {
-    await client.connect();
-    return await fn(client);
-  } finally {
-    _imapRelease();
-    client.logout().catch(() => {});
-  }
-}
-
-// Like withImap but uses explicit credentials instead of AsyncLocalStorage.
-// Use this when the store context may be lost (e.g. after nodemailer callbacks).
-async function withImapCreds(user, pass, fn) {
-  await _imapAcquire();
-  const client = new ImapFlow({
-    host: (process.env.IMAP_SERVER || "").trim(),
-    port: parseInt(process.env.IMAP_PORT) || 993,
-    secure: true,
-    auth: { user, pass },
-    logger: false,
-  });
-  client.on("error", (err) => {
-    console.error("[imap] socket error:", err.response || err.message);
-  });
-  try {
-    await client.connect();
-    return await fn(client);
-  } finally {
-    _imapRelease();
-    client.logout().catch(() => {});
-  }
-}
-
 // ── In-memory logo cache (domain:source → {buffer, contentType, ts}) ─────────
 const logoCache = new Map();
 const LOGO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
@@ -192,7 +67,7 @@ const LOGO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
 // ── In-memory body cache (uid:folder → {data, ts}) ───────────────────────────
 // Prefetch stores fully-parsed email bodies here so /emails/:id is instant.
 const bodyCache = new Map();
-const BODY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h          //  10 * 60 * 1000; // 10 minutes
+const BODY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
 
 function bodyCacheKey(uid, folder) {
   return `${uid}:${folder || "inbox"}`;
@@ -271,6 +146,62 @@ async function prefetchBodies(stubs) {
   } catch { /* prefetch is best-effort */ }
 }
 
+// ── IMAP connection semaphore ─────────────────────────────────────────────────
+// Gmail caps simultaneous IMAP connections (~15). Concurrent React Query
+// fetches (inbox list, drafts badge, email detail…) can easily exceed this.
+// Limit to 3 concurrent connections and queue the rest.
+const IMAP_CONCURRENCY = 3;
+let _imapSlots = IMAP_CONCURRENCY;
+const _imapQueue = [];
+
+function _imapAcquire() {
+  return new Promise(resolve => {
+    if (_imapSlots > 0) { _imapSlots--; resolve(); }
+    else { _imapQueue.push(resolve); }
+  });
+}
+
+function _imapRelease() {
+  if (_imapQueue.length > 0) { _imapQueue.shift()(); }
+  else { _imapSlots++; }
+}
+
+// Run fn(client) with a connected client, always releasing the slot on exit.
+async function withImap(fn) {
+  await _imapAcquire();
+  const client = makeImapClient();
+  try {
+    await client.connect();
+    return await fn(client);
+  } finally {
+    _imapRelease();
+    client.logout().catch(() => {});
+  }
+}
+
+// Like withImap but uses explicit credentials instead of AsyncLocalStorage.
+// Use this when the store context may be lost (e.g. after nodemailer callbacks).
+async function withImapCreds(user, pass, fn) {
+  await _imapAcquire();
+  const client = new ImapFlow({
+    host: (process.env.IMAP_SERVER || "").trim(),
+    port: parseInt(process.env.IMAP_PORT) || 993,
+    secure: true,
+    auth: { user, pass },
+    logger: false,
+  });
+  client.on("error", (err) => {
+    console.error("[imap] socket error:", err.response || err.message);
+  });
+  try {
+    await client.connect();
+    return await fn(client);
+  } finally {
+    _imapRelease();
+    client.logout().catch(() => {});
+  }
+}
+
 function makeImapClient() {
   const creds = imapCredsStore.getStore();
   const client = new ImapFlow({
@@ -296,38 +227,53 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 
-// ── Session helpers ───────────────────────────────────────────────────────────
+// ── Session helpers with Prisma ───────────────────────────────────────────────
 const SESSION_TTL_DAYS = 7;
 
-function createSession(email, imapUser, imapPass) {
+async function createSession(email, imapUser, imapPass) {
   const token = crypto.randomBytes(32).toString("hex");
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
-  db.prepare(`INSERT INTO sessions (token, email, imap_user, imap_pass, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(token, email, imapUser, encrypt(imapPass), now.toISOString(), expires.toISOString());
+  
+  await prisma.session.create({
+    data: {
+      token,
+      email,
+      imapUser,
+      imapPass: encrypt(imapPass),
+      createdAt: now.toISOString(),
+      expiresAt: expires.toISOString(),
+    }
+  });
+  
   return { token, expires };
 }
 
-function getSession(token) {
+async function getSession(token) {
   if (!token) return null;
-  const row = db.prepare(`SELECT * FROM sessions WHERE token = ?`).get(token);
+  
+  const row = await prisma.session.findUnique({
+    where: { token }
+  });
+  
   if (!row) return null;
-  if (new Date(row.expires_at) < new Date()) {
-    db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+  if (new Date(row.expiresAt) < new Date()) {
+    await prisma.session.delete({ where: { token } });
     return null;
   }
+  
   // Decrypt the password so requireAuth can pass plaintext to makeImapClient
-  return { ...row, imap_pass: decrypt(row.imap_pass) };
+  return { ...row, imap_pass: decrypt(row.imapPass) };
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const token = req.cookies?.session;
-  const session = getSession(token);
+  const session = await getSession(token);
   if (!session) return res.status(401).json({ error: "Unauthorized" });
   req.session = session;
   // Run the rest of the request inside the IMAP credential context so
   // makeImapClient() automatically uses this user's credentials.
-  imapCredsStore.run({ user: session.imap_user, pass: session.imap_pass }, next);
+  imapCredsStore.run({ user: session.imapUser, pass: session.imap_pass }, next);
 }
 
 // ── Auth endpoints (public — no requireAuth) ──────────────────────────────────
@@ -336,14 +282,6 @@ function requireAuth(req, res, next) {
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-
-  // Validate against configured IMAP credentials
-  // const configEmail = (process.env.IMAP_USERNAME || "").trim().toLowerCase();
-  // const configPass  = (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
-
-  // if (email.trim().toLowerCase() !== configEmail) {
-  //   return res.status(401).json({ error: "Invalid email or password" });
-  // }
 
   // Try connecting to IMAP to verify the password is correct
   const testClient = new ImapFlow({
@@ -363,7 +301,7 @@ app.post("/auth/login", async (req, res) => {
 
   const imapUser = email.trim().toLowerCase();
   const imapPass = password.replace(/\s/g, "");
-  const { token, expires } = createSession(imapUser, imapUser, imapPass);
+  const { token, expires } = await createSession(imapUser, imapUser, imapPass);
   res.cookie("session", token, {
     httpOnly: true,
     sameSite: "lax",
@@ -374,17 +312,19 @@ app.post("/auth/login", async (req, res) => {
 });
 
 // POST /auth/logout
-app.post("/auth/logout", (req, res) => {
+app.post("/auth/logout", async (req, res) => {
   const token = req.cookies?.session;
-  if (token) db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+  if (token) {
+    await prisma.session.delete({ where: { token } }).catch(() => {});
+  }
   res.clearCookie("session", { path: "/" });
   res.json({ ok: true });
 });
 
 // GET /auth/me — check current session
-app.get("/auth/me", (req, res) => {
+app.get("/auth/me", async (req, res) => {
   const token = req.cookies?.session;
-  const session = getSession(token);
+  const session = await getSession(token);
   if (!session) return res.status(401).json({ error: "Unauthorized" });
   res.json({ email: session.email });
 });
@@ -759,7 +699,7 @@ app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
   // Capture IMAP creds before any async work — multer's async file parsing
   // loses the AsyncLocalStorage context (same issue as /send-email).
   const smtpUser = (process.env.SMTP_USERNAME || "").trim();
-  const imapUser = req.session.imap_user || smtpUser;
+  const imapUser = req.session.imapUser || smtpUser;
   const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
 
   const { to, subject, text, html } = req.body;
@@ -826,7 +766,7 @@ app.post("/send-email", upload.array("attachments"), async (req, res) => {
 
   // Capture IMAP credentials now — AsyncLocalStorage context can be lost
   // after nodemailer's internal stream callbacks, so we hold them explicitly.
-  const imapUser = req.session.imap_user || smtpUser;
+  const imapUser = req.session.imapUser || smtpUser;
   const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
 
   const fromField = imapUser;
@@ -977,40 +917,6 @@ app.get("/emails", async (req, res) => {
   }
 });
 
-
-
-// app.get("/emails", async (req, res) => {
-//   const client = new ImapFlow({
-//     host: process.env.IMAP_SERVER,
-//     port: process.env.IMAP_PORT,
-//     secure: true,
-//     auth: {
-//       user: process.env.IMAP_USERNAME,
-//       pass: process.env.IMAP_PASSWORD
-//     }
-//   });
-
-//   await client.connect();
-
-//   let emails = [];
-//   let lock = await client.getMailboxLock("INBOX");
-
-//   try {
-//     for await (let msg of client.fetch("1:*", { envelope: true })) {
-//       emails.push({
-//         subject: msg.envelope.subject,
-//         from: msg.envelope.from[0].address
-//       });
-//     }
-//   } finally {
-//     lock.release();
-//   }
-
-//   await client.logout();
-//   res.json(emails);
-// });
-
-
 app.get("/emails/starred", async (req, res) => {
   try {
     await withImap(async (client) => {
@@ -1140,8 +1046,21 @@ app.get("/emails/drafts", async (req, res) => {
 // ── GET /emails/snoozed ──────────────────────────────────────────────────────
 app.get("/emails/snoozed", async (req, res) => {
   const now = new Date().toISOString();
-  deleteExpiredSnooze.run(now);
-  const rows = getActiveSnoozed.all(now);
+  
+  // Delete expired snoozed items
+  await prisma.snoozed.deleteMany({
+    where: {
+      snoozeUntil: { lte: now }
+    }
+  });
+  
+  const rows = await prisma.snoozed.findMany({
+    where: {
+      snoozeUntil: { gt: now }
+    },
+    orderBy: { snoozeUntil: 'asc' }
+  });
+  
   if (rows.length === 0) return res.json({ emails: [], total: 0 });
 
   // Group UIDs by source folder so we open each mailbox once
@@ -1176,7 +1095,7 @@ app.get("/emails/snoozed", async (req, res) => {
                 ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                 : date.toLocaleDateString([], { month: "short", day: "numeric" }),
               date: date.toISOString(), label: "snoozed",
-              snoozeUntil:  rowData?.snooze_until,
+              snoozeUntil:  rowData?.snoozeUntil,
               sourceFolder: folderHint,
               attachments: collectAttachments(msg.bodyStructure),
               hasAttachment: collectAttachments(msg.bodyStructure).length > 0,
@@ -1196,19 +1115,29 @@ app.get("/emails/snoozed", async (req, res) => {
 });
 
 // ── POST /emails/:id/snooze ───────────────────────────────────────────────────
-app.post("/emails/:id/snooze", (req, res) => {
+app.post("/emails/:id/snooze", async (req, res) => {
   const uid = parseInt(req.params.id);
   const { snooze_until, folder = "inbox" } = req.body;
   if (!snooze_until) return res.status(400).json({ error: "snooze_until required" });
-  upsertSnooze.run({ uid, folder, snooze_until });
+  
+  await prisma.snoozed.upsert({
+    where: { uid_folder: { uid, folder } },
+    update: { snoozeUntil: snooze_until },
+    create: { uid, folder, snoozeUntil: snooze_until }
+  });
+  
   res.json({ success: true });
 });
 
 // ── DELETE /emails/:id/snooze — remove snooze (unsnooze) ─────────────────────
-app.delete("/emails/:id/snooze", (req, res) => {
+app.delete("/emails/:id/snooze", async (req, res) => {
   const uid = parseInt(req.params.id);
   const folder = req.query.folder || "inbox";
-  deleteSnooze.run(uid, folder);
+  
+  await prisma.snoozed.delete({
+    where: { uid_folder: { uid, folder } }
+  }).catch(() => {});
+  
   res.json({ success: true });
 });
 
@@ -1716,7 +1645,6 @@ app.post("/emails/:id/spam", async (req, res) => {
   });
 });
 
-// ── GET /emails/trash ────────────────────────────────────────────────────────
 // ── POST /emails/:id/trash ───────────────────────────────────────────────────
 app.post("/emails/:id/trash", async (req, res) => {
   const uid = parseInt(req.params.id);
@@ -1841,68 +1769,112 @@ app.post("/emails/:id/move", async (req, res) => {
 // ── POST /contacts ───────────────────────────────────────────────────────────
 // Called by the frontend after a successful send to persist recipients.
 // Body: [{ name, email }, ...]
-app.post("/contacts", (req, res) => {
+app.post("/contacts", async (req, res) => {
   const list = Array.isArray(req.body) ? req.body : [];
   const now = new Date().toISOString();
-  const insertMany = db.transaction((contacts) => {
-    for (const c of contacts) {
-      if (!c.email) continue;
-      upsertContact.run({ email: c.email.trim(), name: (c.name || c.email).trim(), last_sent: now });
-    }
-  });
-  insertMany(list);
+  
+  for (const c of list) {
+    if (!c.email) continue;
+    
+    await prisma.sentContact.upsert({
+      where: { email: c.email.trim() },
+      update: {
+        name: (c.name || c.email).trim(),
+        lastSent: now,
+        sentCount: { increment: 1 }
+      },
+      create: {
+        email: c.email.trim(),
+        name: (c.name || c.email).trim(),
+        lastSent: now,
+        sentCount: 1
+      }
+    });
+  }
+  
   res.json({ ok: true });
 });
 
 // ── GET /contacts?q=query ────────────────────────────────────────────────────
 // Returns contacts from SQLite only, ordered by sent_count DESC.
-app.get("/contacts", (req, res) => {
+app.get("/contacts", async (req, res) => {
   const q = (req.query.q || "").trim();
 
   // No query → return top 50 for pre-loading
-  if (!q) return res.json(topContacts.all());
+  if (!q) {
+    const contacts = await prisma.sentContact.findMany({
+      orderBy: [
+        { sentCount: 'desc' },
+        { lastSent: 'desc' }
+      ],
+      take: 50,
+      select: { name: true, email: true }
+    });
+    return res.json(contacts);
+  }
 
-  res.json(searchContacts.all({ q: `%${q}%` }));
+  const contacts = await prisma.sentContact.findMany({
+    where: {
+      OR: [
+        {
+          email: {
+            contains: q,
+            // mode: 'insensitive'
+          }
+        },
+        {
+          name: {
+            contains: q,
+            // mode: 'insensitive'
+          }
+        }
+      ]
+    },
+    orderBy: [
+      { sentCount: 'desc' },
+      { lastSent: 'desc' }
+    ],
+    take: 10,
+    select: { name: true, email: true }
+  });
+  
+  res.json(contacts);
 });
 
 // ── Recent searches ───────────────────────────────────────────────────────────
-const getRecentSearches = db.prepare(`
-  SELECT query FROM recent_searches
-  ORDER BY searched_at DESC
-  LIMIT 8
-`);
-const upsertRecentSearch = db.prepare(`
-  INSERT INTO recent_searches (query, searched_at)
-  VALUES (@query, @searched_at)
-  ON CONFLICT(query) DO UPDATE SET searched_at = excluded.searched_at
-`);
-const deleteRecentSearch = db.prepare(`
-  DELETE FROM recent_searches WHERE query = @query COLLATE NOCASE
-`);
-const clearRecentSearches = db.prepare(`DELETE FROM recent_searches`);
-
-// GET /recent-searches — return the 8 most recent
-app.get("/recent-searches", (req, res) => {
-  res.json(getRecentSearches.all().map(r => r.query));
+app.get("/recent-searches", async (req, res) => {
+  const searches = await prisma.recentSearch.findMany({
+    orderBy: { searchedAt: 'desc' },
+    take: 8,
+    select: { query: true }
+  });
+  
+  res.json(searches.map(s => s.query));
 });
 
-// POST /recent-searches — save or bump a search query
-app.post("/recent-searches", (req, res) => {
+app.post("/recent-searches", async (req, res) => {
   const query = (req.body?.query || "").trim();
   if (!query) return res.status(400).json({ error: "query required" });
-  upsertRecentSearch.run({ query, searched_at: new Date().toISOString() });
+  
+  await prisma.recentSearch.upsert({
+    where: { query },
+    update: { searchedAt: new Date().toISOString() },
+    create: { query, searchedAt: new Date().toISOString() }
+  });
+  
   res.json({ ok: true });
 });
 
-// DELETE /recent-searches/:query — remove one entry
-app.delete("/recent-searches/:query", (req, res) => {
-  deleteRecentSearch.run({ query: decodeURIComponent(req.params.query) });
+app.delete("/recent-searches/:query", async (req, res) => {
+  await prisma.recentSearch.delete({
+    where: { query: decodeURIComponent(req.params.query) }
+  }).catch(() => {});
+  
   res.json({ ok: true });
 });
 
-// DELETE /recent-searches — clear all
-app.delete("/recent-searches", (req, res) => {
-  clearRecentSearches.run();
+app.delete("/recent-searches", async (req, res) => {
+  await prisma.recentSearch.deleteMany();
   res.json({ ok: true });
 });
 
@@ -1937,22 +1909,37 @@ app.get("/storage", async (req, res) => {
 // ── Signature endpoints ───────────────────────────────────────────────────────
 
 // GET /signature — return the default signature for the logged-in user (or first one)
-app.get("/signature", (req, res) => {
+app.get("/signature", async (req, res) => {
   const email = req.session.email;
-  const row = db.prepare(`SELECT id, name, html FROM signatures WHERE user_email = ? AND is_default = 1 LIMIT 1`).get(email)
-    || db.prepare(`SELECT id, name, html FROM signatures WHERE user_email = ? ORDER BY id ASC LIMIT 1`).get(email);
-  res.json(row || { id: null, name: "", html: "" });
+  
+  let signature = await prisma.signature.findFirst({
+    where: { userEmail: email, isDefault: 1 }
+  });
+  
+  if (!signature) {
+    signature = await prisma.signature.findFirst({
+      where: { userEmail: email },
+      orderBy: { id: 'asc' }
+    });
+  }
+  
+  res.json(signature || { id: null, name: "", html: "" });
 });
 
 // GET /signatures — return all signatures for the logged-in user
-app.get("/signatures", (req, res) => {
+app.get("/signatures", async (req, res) => {
   const email = req.session.email;
-  const rows = db.prepare(`SELECT id, name, html, is_default FROM signatures WHERE user_email = ? ORDER BY id ASC`).all(email);
-  res.json(rows);
+  const signatures = await prisma.signature.findMany({
+    where: { userEmail: email },
+    orderBy: { id: 'asc' },
+    select: { id: true, name: true, html: true, isDefault: true }
+  });
+  
+  res.json(signatures);
 });
 
 // POST /signature — save (upsert) a signature for the logged-in user
-app.post("/signature", (req, res) => {
+app.post("/signature", async (req, res) => {
   const email = req.session.email;
   const { id, name, html, is_default } = req.body || {};
   if (typeof html !== "string") return res.status(400).json({ error: "html required" });
@@ -1960,26 +1947,54 @@ app.post("/signature", (req, res) => {
 
   if (id) {
     // update existing — only if it belongs to this user
-    db.prepare(`UPDATE signatures SET name = ?, html = ?, is_default = ? WHERE id = ? AND user_email = ?`)
-      .run(sigName, html, is_default ? 1 : 0, id, email);
+    await prisma.signature.updateMany({
+      where: { id: parseInt(id), userEmail: email },
+      data: {
+        name: sigName,
+        html,
+        isDefault: is_default ? 1 : 0
+      }
+    });
+    
     if (is_default) {
-      db.prepare(`UPDATE signatures SET is_default = 0 WHERE user_email = ? AND id != ?`).run(email, id);
+      await prisma.signature.updateMany({
+        where: { userEmail: email, id: { not: parseInt(id) } },
+        data: { isDefault: 0 }
+      });
     }
+    
     return res.json({ ok: true, id });
   } else {
     // insert new
-    const info = db.prepare(`INSERT INTO signatures (user_email, name, html, is_default) VALUES (?, ?, ?, ?)`)
-      .run(email, sigName, html, is_default ? 1 : 0);
+    const result = await prisma.signature.create({
+      data: {
+        userEmail: email,
+        name: sigName,
+        html,
+        isDefault: is_default ? 1 : 0
+      }
+    });
+    
     if (is_default) {
-      db.prepare(`UPDATE signatures SET is_default = 0 WHERE user_email = ? AND id != ?`).run(email, info.lastInsertRowid);
+      await prisma.signature.updateMany({
+        where: { userEmail: email, id: { not: result.id } },
+        data: { isDefault: 0 }
+      });
     }
-    return res.json({ ok: true, id: info.lastInsertRowid });
+    
+    return res.json({ ok: true, id: result.id });
   }
 });
 
 // DELETE /signature/:id — delete a signature (only if it belongs to this user)
-app.delete("/signature/:id", (req, res) => {
-  db.prepare(`DELETE FROM signatures WHERE id = ? AND user_email = ?`).run(req.params.id, req.session.email);
+app.delete("/signature/:id", async (req, res) => {
+  await prisma.signature.deleteMany({
+    where: {
+      id: parseInt(req.params.id),
+      userEmail: req.session.email
+    }
+  });
+  
   res.json({ ok: true });
 });
 
@@ -1995,6 +2010,12 @@ app.get("/debug/mailboxes", async (req, res) => {
   }
 });
 
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+process.on('beforeExit', async () => {
+  await prisma.$disconnect();
+});
+
 // ── User settings endpoints ───────────────────────────────────────────────────
 
-app.listen(process.env.PORT || 3000, () => console.log(`Server running on port ${process.env.PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model SentContact {
+  email     String   @id @map("email")
+  name      String   @map("name")
+  sentCount Int      @default(1) @map("sent_count")
+  lastSent  DateTime @map("last_sent")
+
+  @@map("sent_contacts")
+}
+
+model Snoozed {
+  uid         Int      @map("uid")
+  folder      String   @default("inbox") @map("folder")
+  snoozeUntil DateTime @map("snooze_until")
+
+  @@id([uid, folder])
+  @@map("snoozed")
+}
+
+model RecentSearch {
+  id         Int      @id @default(autoincrement())
+  query      String   @unique @map("query")
+  searchedAt DateTime @map("searched_at")
+
+  @@map("recent_searches")
+}
+
+model Signature {
+  id        Int    @id @default(autoincrement())
+  userEmail String @default("") @map("user_email")
+  name      String @default("Default") @map("name")
+  html      String @default("") @map("html")
+  isDefault Int    @default(0) @map("is_default")
+
+  @@map("signatures")
+}
+
+model Session {
+  token     String   @id @map("token")
+  email     String   @map("email")
+  imapUser  String   @default("") @map("imap_user")
+  imapPass  String   @default("") @map("imap_pass")
+  createdAt DateTime @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@map("sessions")
+}
+
+model UserSettings {
+  id Int @id @default(autoincrement())
+
+  @@map("user_settings")
+}
