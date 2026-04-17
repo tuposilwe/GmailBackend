@@ -8,14 +8,8 @@ const multer = require("multer");
 const crypto = require("crypto");
 const cookieParser = require("cookie-parser");
 const { AsyncLocalStorage } = require("async_hooks");
-const { PrismaClient } = require('@prisma/client');
+const { prisma} = require("./lib/prisma")
 require('dotenv').config({ path: path.join(__dirname, '.env') });
-
-// Initialize Prisma Client
-// const prisma = new PrismaClient();
-const prisma = new PrismaClient({
-  log: ['query', 'info', 'warn', 'error'],
-});
 
 // Propagates the logged-in user's IMAP credentials through async call chains
 // so makeImapClient() always uses the right account without changing call sites.
