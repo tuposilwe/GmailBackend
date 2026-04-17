@@ -84,6 +84,35 @@ function bodySet(uid, folder, data) {
   bodyCache.set(bodyCacheKey(uid, folder), { data, ts: Date.now() });
 }
 
+// ── In-memory attachment cache (uid:folder:index → {buffer, contentType, filename, ts}) ──
+// All attachments of an email are cached together on the first fetch so
+// subsequent requests (thumbnail, preview, download) are served instantly.
+const attachmentCache = new Map();
+const ATTACHMENT_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
+
+function attKey(uid, folder, index) {
+  return `${uid}:${folder || "inbox"}:${index}`;
+}
+
+function attGet(uid, folder, index) {
+  const entry = attachmentCache.get(attKey(uid, folder, index));
+  if (!entry) return null;
+  if (Date.now() - entry.ts > ATTACHMENT_CACHE_TTL) { attachmentCache.delete(attKey(uid, folder, index)); return null; }
+  return entry;
+}
+
+function attSetAll(uid, folder, attachments) {
+  const ts = Date.now();
+  attachments.forEach((att, i) => {
+    attachmentCache.set(attKey(uid, folder, i), {
+      buffer: att.content,
+      contentType: att.contentType || "application/octet-stream",
+      filename: att.filename || `attachment-${i + 1}`,
+      ts,
+    });
+  });
+}
+
 // Prefetch bodies for a list of {id, folder} email stubs in the background.
 // Uses a dedicated IMAP connection so it never blocks active requests.
 // Skips any uid already cached. Silently swallows errors.
@@ -1466,6 +1495,18 @@ app.get("/emails/:id/attachments/:index", async (req, res) => {
   const uid   = parseInt(req.params.id);
   const index = parseInt(req.params.index);
   const folderHint = req.query.folder || "inbox";
+  const inline = req.query.preview === "1";
+
+  // Serve from cache if available
+  const cached = attGet(uid, folderHint, index);
+  if (cached) {
+    const disposition = inline ? "inline" : "attachment";
+    res.setHeader("Content-Type", cached.contentType);
+    res.setHeader("Content-Disposition", `${disposition}; filename*=UTF-8''${encodeURIComponent(cached.filename)}`);
+    res.setHeader("Content-Length", cached.buffer.length);
+    return res.end(cached.buffer);
+  }
+
   try {
     await withImap(async (client) => {
       const mailboxPath = await resolveMailbox(client, folderHint);
@@ -1474,11 +1515,15 @@ app.get("/emails/:id/attachments/:index", async (req, res) => {
         const download = await client.download(`${uid}`, undefined, { uid: true });
         if (!download || !download.content) return res.status(404).json({ error: "Message not found" });
         const parsed = await simpleParser(download.content);
-        const att = (parsed.attachments || [])[index];
+        const atts = parsed.attachments || [];
+        // Cache all attachments from this email at once
+        attSetAll(uid, folderHint, atts);
+        const att = atts[index];
         if (!att) return res.status(404).json({ error: "Attachment not found" });
         const filename = encodeURIComponent(att.filename || `attachment-${index + 1}`);
+        const disposition = inline ? "inline" : "attachment";
         res.setHeader("Content-Type", att.contentType || "application/octet-stream");
-        res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${filename}`);
+        res.setHeader("Content-Disposition", `${disposition}; filename*=UTF-8''${filename}`);
         res.setHeader("Content-Length", att.content.length);
         res.end(att.content);
       } finally { lock.release(); }
