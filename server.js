@@ -2017,5 +2017,12 @@ process.on('beforeExit', async () => {
 
 // ── User settings endpoints ───────────────────────────────────────────────────
 
+// Serve React production build
+const buildPath = path.join(__dirname, "../my-gmail/build");
+app.use(express.static(buildPath));
+app.get("/{*path}", (req, res) => {
+  res.sendFile(path.join(buildPath, "index.html"));
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
