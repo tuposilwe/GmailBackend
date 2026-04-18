@@ -8,6 +8,9 @@ const multer = require("multer");
 const crypto = require("crypto");
 const cookieParser = require("cookie-parser");
 const { AsyncLocalStorage } = require("async_hooks");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const cookie = require("cookie");
 const { prisma} = require("./lib/prisma")
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -2063,5 +2066,144 @@ app.get("/{*path}", (req, res) => {
   res.sendFile(path.join(buildPath, "index.html"));
 });
 
+// ── WebSocket server for real-time new-email notifications ───────────────────
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/mail-events" });
+
+// Parse session cookie from the raw WS upgrade request headers
+async function getWsSession(req) {
+  try {
+    const cookies = cookie.parse(req.headers.cookie || "");
+    return await getSession(cookies.session);
+  } catch {
+    return null;
+  }
+}
+
+// IMAP IDLE loop — runs for the lifetime of one WebSocket connection.
+// Calls onNew(emails[]) whenever fresh unread messages appear in INBOX.
+//
+// ImapFlow's idle() does NOT return when EXISTS fires — it blocks until the
+// IDLE session ends. The correct approach is to rely on ImapFlow's built-in
+// autoidle (fires after 15 s of inactivity) and respond to the "exists" event
+// directly: calling client.fetch() inside the handler automatically sends DONE
+// to exit IDLE before executing the FETCH command.
+async function runImapIdle(user, pass, signal, onNew) {
+  const makeClient = () => new ImapFlow({
+    host: (process.env.IMAP_SERVER || "").trim(),
+    port: parseInt(process.env.IMAP_PORT) || 993,
+    secure: true,
+    auth: { user, pass },
+    logger: false,
+  });
+
+  const reconnectDelay = (attempt) => Math.min(30_000, 2_000 * 2 ** attempt);
+
+  for (let attempt = 0; !signal.aborted; attempt++) {
+    const client = makeClient();
+    client.on("error", () => {});
+
+    try {
+      console.log(`[ws-idle] connecting to IMAP (attempt ${attempt}) for ${user}`);
+      await client.connect();
+      const lock = await client.getMailboxLock("INBOX");
+
+      let prevCount = client.mailbox.exists ?? 0;
+      console.log(`[ws-idle] IMAP connected for ${user}, inbox has ${prevCount} messages`);
+
+      attempt = 0; // reset backoff on successful connect
+
+      // ImapFlow fires "exists" while in autoidle. Calling client.fetch()
+      // here is safe — ImapFlow sends DONE automatically before the fetch.
+      const onExists = async ({ count }) => {
+        console.log(`[ws-idle] EXISTS event: count=${count} (was ${prevCount})`);
+        if (count <= prevCount) return;
+
+        const newCount = count - prevCount;
+        const startSeq = Math.max(1, count - newCount + 1);
+        prevCount = count;
+
+        console.log(`[ws-idle] fetching ${newCount} new message(s) seq ${startSeq}:${count}`);
+        try {
+          const fetched = [];
+          for await (const msg of client.fetch(
+            `${startSeq}:${count}`,
+            { envelope: true, flags: true, uid: true }
+          )) {
+            if (msg.flags?.has("\\Seen")) continue;
+            const fromObj = msg.envelope.from?.[0];
+            const senderName = fromObj?.name || fromObj?.address?.split("@")[0] || "Unknown";
+            const senderEmail = fromObj?.address || "";
+            const subject = msg.envelope.subject || "(no subject)";
+            const date = new Date(msg.envelope.date);
+            const isToday = date.toDateString() === new Date().toDateString();
+            fetched.push({
+              id: msg.uid,
+              subject,
+              senderName,
+              senderEmail,
+              time: isToday
+                ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                : date.toLocaleDateString([], { month: "short", day: "numeric" }),
+              date: date.toISOString(),
+              unread: true,
+            });
+          }
+          console.log(`[ws-idle] sending ${fetched.length} unread email(s) to client`);
+          if (fetched.length > 0) onNew(fetched);
+        } catch (e) {
+          console.error("[ws-idle] fetch error:", e.message);
+        }
+      };
+
+      client.on("exists", onExists);
+
+      // Hold the connection open until the WS is closed or the connection drops.
+      await new Promise((resolve) => {
+        signal.addEventListener("abort", resolve, { once: true });
+        client.once("close", resolve);
+        client.once("error", resolve);
+      });
+
+      client.removeListener("exists", onExists);
+      lock.release().catch(() => {});
+    } catch (err) {
+      if (signal.aborted) break;
+      console.error("[ws-idle] error, reconnecting:", err.message);
+    } finally {
+      client.logout().catch(() => {});
+    }
+
+    if (!signal.aborted) {
+      await new Promise((r) => setTimeout(r, reconnectDelay(attempt)));
+    }
+  }
+}
+
+wss.on("connection", async (ws, req) => {
+  const session = await getWsSession(req);
+  if (!session) { ws.close(4001, "Unauthorized"); return; }
+
+  const { imapUser, imap_pass } = session;
+  const ac = new AbortController();
+
+  ws.on("close", () => ac.abort());
+  ws.on("error", () => ac.abort());
+
+  // Ping every 30 s to keep the connection alive through proxies/firewalls
+  const ping = setInterval(() => {
+    if (ws.readyState === ws.OPEN) ws.ping();
+  }, 30_000);
+  ws.on("close", () => clearInterval(ping));
+
+  console.log(`[ws] client connected: ${imapUser}`);
+
+  runImapIdle(imapUser, imap_pass, ac.signal, (emails) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "new_emails", emails }));
+    }
+  }).catch(() => {});
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
