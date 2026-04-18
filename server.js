@@ -2205,5 +2205,16 @@ wss.on("connection", async (ws, req) => {
   }).catch(() => {});
 });
 
+server.on("error", (err) => {
+  if (err.code !== "ECONNRESET") console.error("[server] error:", err);
+});
+
+// Suppress ECONNRESET on individual sockets (proxy/browser abrupt closes)
+server.on("connection", (socket) => {
+  socket.on("error", (err) => {
+    if (err.code !== "ECONNRESET") console.error("[socket] error:", err);
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
