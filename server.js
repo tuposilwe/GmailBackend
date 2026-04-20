@@ -207,11 +207,11 @@ async function withImap(fn) {
 
 // Like withImap but uses explicit credentials instead of AsyncLocalStorage.
 // Use this when the store context may be lost (e.g. after nodemailer callbacks).
-async function withImapCreds(user, pass, fn) {
+async function withImapCreds(user, pass, fn, host, port) {
   await _imapAcquire();
   const client = new ImapFlow({
-    host: (process.env.IMAP_SERVER || "").trim(),
-    port: parseInt(process.env.IMAP_PORT) || 993,
+    host: (host || process.env.IMAP_SERVER || "").trim(),
+    port: port || parseInt(process.env.IMAP_PORT) || 993,
     secure: true,
     auth: { user, pass },
     logger: false,
@@ -231,8 +231,8 @@ async function withImapCreds(user, pass, fn) {
 function makeImapClient() {
   const creds = imapCredsStore.getStore();
   const client = new ImapFlow({
-    host: (process.env.IMAP_SERVER || "").trim(),
-    port: parseInt(process.env.IMAP_PORT) || 993,
+    host: (creds?.host || process.env.IMAP_SERVER || "").trim(),
+    port: creds?.port || parseInt(process.env.IMAP_PORT) || 993,
     secure: true,
     auth: {
       user: creds?.user || (process.env.IMAP_USERNAME || "").trim(),
@@ -256,22 +256,24 @@ app.use(cookieParser());
 // ── Session helpers with Prisma ───────────────────────────────────────────────
 const SESSION_TTL_DAYS = 7;
 
-async function createSession(email, imapUser, imapPass) {
+async function createSession(email, imapUser, imapPass, imapServer, imapPort) {
   const token = crypto.randomBytes(32).toString("hex");
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
-  
+
   await prisma.session.create({
     data: {
       token,
       email,
       imapUser,
       imapPass: encrypt(imapPass),
+      imapServer: imapServer || (process.env.IMAP_SERVER || "").trim(),
+      imapPort:   imapPort   || (parseInt(process.env.IMAP_PORT) || 993),
       createdAt: now.toISOString(),
       expiresAt: expires.toISOString(),
     }
   });
-  
+
   return { token, expires };
 }
 
@@ -288,8 +290,12 @@ async function getSession(token) {
     return null;
   }
   
-  // Decrypt the password so requireAuth can pass plaintext to makeImapClient
-  return { ...row, imap_pass: decrypt(row.imapPass) };
+  return {
+    ...row,
+    imap_pass:   decrypt(row.imapPass),
+    imap_server: row.imapServer || (process.env.IMAP_SERVER || "").trim(),
+    imap_port:   row.imapPort   || (parseInt(process.env.IMAP_PORT) || 993),
+  };
 }
 
 async function requireAuth(req, res, next) {
@@ -297,44 +303,63 @@ async function requireAuth(req, res, next) {
   const session = await getSession(token);
   if (!session) return res.status(401).json({ error: "Unauthorized" });
   req.session = session;
-  // Run the rest of the request inside the IMAP credential context so
-  // makeImapClient() automatically uses this user's credentials.
-  imapCredsStore.run({ user: session.imapUser, pass: session.imap_pass }, next);
+  imapCredsStore.run({
+    user: session.imapUser,
+    pass: session.imap_pass,
+    host: session.imap_server,
+    port: session.imap_port,
+  }, next);
 }
 
 // ── Auth endpoints (public — no requireAuth) ──────────────────────────────────
 
-// POST /auth/login — validate credentials by testing IMAP connection
+// POST /auth/login — try each admin-configured IMAP server in order, then env fallback
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
-  // Try connecting to IMAP to verify the password is correct
-  const testClient = new ImapFlow({
-    host: process.env.IMAP_SERVER,
-    port: parseInt(process.env.IMAP_PORT),
-    secure: true,
-    auth: { user: email.trim(), pass: password.replace(/\s/g, "") },
-    logger: false,
-  });
-
-  try {
-    await testClient.connect();
-    await testClient.logout();
-  } catch {
-    return res.status(401).json({ error: "Invalid email or password" });
-  }
-
   const imapUser = email.trim().toLowerCase();
   const imapPass = password.replace(/\s/g, "");
-  const { token, expires } = await createSession(imapUser, imapUser, imapPass);
+
+  // Build candidate list: DB servers first, then env fallback
+  const dbServers = await prisma.imapServer.findMany({ orderBy: { createdAt: "asc" } });
+  const candidates = dbServers.map(s => ({ host: s.host, port: s.port }));
+  const envHost = (process.env.IMAP_SERVER || "").trim();
+  if (envHost) candidates.push({ host: envHost, port: parseInt(process.env.IMAP_PORT) || 993 });
+
+  if (candidates.length === 0)
+    return res.status(503).json({ error: "No IMAP servers configured" });
+
+  let matchedHost = null;
+  let matchedPort = null;
+
+  for (const { host, port } of candidates) {
+    const client = new ImapFlow({
+      host, port, secure: true,
+      auth: { user: imapUser, pass: imapPass },
+      logger: false,
+    });
+    client.on("error", () => {});
+    try {
+      await client.connect();
+      await client.logout();
+      matchedHost = host;
+      matchedPort = port;
+      break;
+    } catch { /* try next */ }
+  }
+
+  if (!matchedHost)
+    return res.status(401).json({ error: "Invalid email or password" });
+
+  const { token, expires } = await createSession(imapUser, imapUser, imapPass, matchedHost, matchedPort);
   res.cookie("session", token, {
     httpOnly: true,
     sameSite: "lax",
     expires,
     path: "/",
   });
-  res.json({ ok: true, email: email.trim().toLowerCase() });
+  res.json({ ok: true, email: imapUser });
 });
 
 // POST /auth/logout
@@ -353,6 +378,114 @@ app.get("/auth/me", async (req, res) => {
   const session = await getSession(token);
   if (!session) return res.status(401).json({ error: "Unauthorized" });
   res.json({ email: session.email });
+});
+
+// ── Public: list configured IMAP servers for login page ──────────────────────
+app.get("/imap-servers", async (_req, res) => {
+  const servers = await prisma.imapServer.findMany({
+    orderBy: { createdAt: "asc" },
+    select: { id: true, label: true, host: true, port: true },
+  });
+  res.json(servers);
+});
+
+// ── Admin session (in-memory) ─────────────────────────────────────────────────
+const adminSessions = new Map(); // token → expiresAt
+const ADMIN_SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+function createAdminSession() {
+  const token = crypto.randomBytes(32).toString("hex");
+  adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
+  return token;
+}
+
+function isValidAdminSession(token) {
+  if (!token) return false;
+  const exp = adminSessions.get(token);
+  if (!exp) return false;
+  if (Date.now() > exp) { adminSessions.delete(token); return false; }
+  return true;
+}
+
+function requireAdmin(req, res, next) {
+  if (!isValidAdminSession(req.cookies?.admin_session))
+    return res.status(401).json({ error: "Admin unauthorized" });
+  next();
+}
+
+// POST /admin/login
+app.post("/admin/login", (req, res) => {
+  const { password } = req.body || {};
+  const adminPass = process.env.ADMIN_PASSWORD;
+  if (!adminPass) return res.status(503).json({ error: "Admin not configured" });
+  if (!password || password !== adminPass)
+    return res.status(401).json({ error: "Invalid admin password" });
+  const token = createAdminSession();
+  res.cookie("admin_session", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    maxAge: ADMIN_SESSION_TTL_MS,
+    path: "/",
+  });
+  res.json({ ok: true });
+});
+
+// POST /admin/logout
+app.post("/admin/logout", (req, res) => {
+  const token = req.cookies?.admin_session;
+  if (token) adminSessions.delete(token);
+  res.clearCookie("admin_session", { path: "/" });
+  res.json({ ok: true });
+});
+
+// GET /admin/me
+app.get("/admin/me", (req, res) => {
+  if (!isValidAdminSession(req.cookies?.admin_session))
+    return res.status(401).json({ error: "Admin unauthorized" });
+  res.json({ ok: true });
+});
+
+// GET /admin/imap-servers
+app.get("/admin/imap-servers", requireAdmin, async (_req, res) => {
+  const servers = await prisma.imapServer.findMany({ orderBy: { createdAt: "asc" } });
+  res.json(servers);
+});
+
+// POST /admin/imap-servers
+app.post("/admin/imap-servers", requireAdmin, async (req, res) => {
+  const { label, host, port } = req.body || {};
+  if (!label || !host) return res.status(400).json({ error: "label and host are required" });
+  const server = await prisma.imapServer.create({
+    data: { label: label.trim(), host: host.trim(), port: parseInt(port) || 993 },
+  });
+  res.json(server);
+});
+
+// PUT /admin/imap-servers/:id
+app.put("/admin/imap-servers/:id", requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { label, host, port } = req.body || {};
+  if (!label || !host) return res.status(400).json({ error: "label and host are required" });
+  try {
+    const server = await prisma.imapServer.update({
+      where: { id },
+      data: { label: label.trim(), host: host.trim(), port: parseInt(port) || 993 },
+    });
+    res.json(server);
+  } catch {
+    res.status(404).json({ error: "Server not found" });
+  }
+});
+
+// DELETE /admin/imap-servers/:id
+app.delete("/admin/imap-servers/:id", requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    await prisma.imapServer.delete({ where: { id } });
+    res.json({ ok: true });
+  } catch {
+    res.status(404).json({ error: "Server not found" });
+  }
 });
 
 // ── Apply auth middleware to all subsequent routes ────────────────────────────
@@ -725,8 +858,10 @@ app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
   // Capture IMAP creds before any async work — multer's async file parsing
   // loses the AsyncLocalStorage context (same issue as /send-email).
   const smtpUser = (process.env.SMTP_USERNAME || "").trim();
-  const imapUser = req.session.imapUser || smtpUser;
-  const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+  const imapUser   = req.session.imapUser   || smtpUser;
+  const imapPass   = req.session.imap_pass  || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+  const imapServer = req.session.imap_server || (process.env.IMAP_SERVER || "").trim();
+  const imapPort   = req.session.imap_port  || parseInt(process.env.IMAP_PORT) || 993;
 
   const { to, subject, text, html } = req.body;
 
@@ -755,7 +890,7 @@ app.post("/emails/drafts", upload.array("attachments"), async (req, res) => {
       if (!draftsPath) return res.status(500).json({ error: "Drafts folder not found" });
       await client.append(draftsPath, rawMessage, ["\\Draft", "\\Seen"]);
       res.json({ success: true });
-    });
+    }, imapServer, imapPort);
   } catch (err) {
     console.error("[imap] save draft error:", err.response || err.message);
     if (!res.headersSent) res.status(500).json({ error: err.response || err.message });
@@ -792,8 +927,10 @@ app.post("/send-email", upload.array("attachments"), async (req, res) => {
 
   // Capture IMAP credentials now — AsyncLocalStorage context can be lost
   // after nodemailer's internal stream callbacks, so we hold them explicitly.
-  const imapUser = req.session.imapUser || smtpUser;
-  const imapPass = req.session.imap_pass || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+  const imapUser   = req.session.imapUser   || smtpUser;
+  const imapPass   = req.session.imap_pass  || (process.env.IMAP_PASSWORD || "").replace(/\s/g, "");
+  const imapServer = req.session.imap_server || (process.env.IMAP_SERVER || "").trim();
+  const imapPort   = req.session.imap_port  || parseInt(process.env.IMAP_PORT) || 993;
 
   const fromField = imapUser;
 
@@ -852,7 +989,7 @@ app.post("/send-email", upload.array("attachments"), async (req, res) => {
       console.log("[imap] Appending to Sent folder:", sentPath);
       await client.append(sentPath, rawMessage, ["\\Seen"]);
       console.log("[imap] Successfully appended to Sent folder");
-    });
+    }, imapServer, imapPort);
   } catch (err) {
     // Don't fail the request — email was already sent successfully via SMTP
     console.error("[imap] append to Sent error:", err.response || err.message);
@@ -2088,10 +2225,10 @@ async function getWsSession(req) {
 // autoidle (fires after 15 s of inactivity) and respond to the "exists" event
 // directly: calling client.fetch() inside the handler automatically sends DONE
 // to exit IDLE before executing the FETCH command.
-async function runImapIdle(user, pass, signal, onNew) {
+async function runImapIdle(user, pass, signal, onNew, host, port) {
   const makeClient = () => new ImapFlow({
-    host: (process.env.IMAP_SERVER || "").trim(),
-    port: parseInt(process.env.IMAP_PORT) || 993,
+    host: (host || process.env.IMAP_SERVER || "").trim(),
+    port: port || parseInt(process.env.IMAP_PORT) || 993,
     secure: true,
     auth: { user, pass },
     logger: false,
@@ -2184,7 +2321,7 @@ wss.on("connection", async (ws, req) => {
   const session = await getWsSession(req);
   if (!session) { ws.close(4001, "Unauthorized"); return; }
 
-  const { imapUser, imap_pass } = session;
+  const { imapUser, imap_pass, imap_server, imap_port } = session;
   const ac = new AbortController();
 
   ws.on("close", () => ac.abort());
@@ -2202,7 +2339,7 @@ wss.on("connection", async (ws, req) => {
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ type: "new_emails", emails }));
     }
-  }).catch(() => {});
+  }, imap_server, imap_port).catch(() => {});
 });
 
 server.on("error", (err) => {
