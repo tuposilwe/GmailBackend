@@ -325,8 +325,18 @@ app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
-  const imapUser = email.trim().toLowerCase();
-  const imapPass = password.replace(/\s/g, "");
+  const ip        = getClientIp(req);
+  const userAgent = req.headers["user-agent"] || "";
+  const imapUser  = email.trim().toLowerCase();
+  const imapPass  = password.replace(/\s/g, "");
+  const domain    = imapUser.includes("@") ? imapUser.split("@")[1] : "";
+
+  // ── Rate limit check ──────────────────────────────────────────────────────
+  const rl = rlCheck(ip);
+  if (rl.blocked) {
+    logAudit({ email: imapUser, ip, userAgent, domain, imapServer: "", success: false, blocked: true });
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${Math.ceil(rl.remainingSec / 60)} min.` });
+  }
 
   // Build candidate list: DB servers first, then env fallback
   const dbServers = await prisma.imapServer.findMany({ orderBy: { createdAt: "asc" } });
@@ -356,8 +366,20 @@ app.post("/auth/login", async (req, res) => {
     } catch { /* try next */ }
   }
 
-  if (!matchedHost)
-    return res.status(401).json({ error: "Invalid email or password" });
+  if (!matchedHost) {
+    rlFailure(ip);
+    const e = rateLimitMap.get(ip);
+    logAudit({ email: imapUser, ip, userAgent, domain, imapServer: "", success: false, blocked: false });
+    const nowBlocked = e?.blockUntil && Date.now() < e.blockUntil;
+    return res.status(401).json({
+      error: nowBlocked
+        ? `Too many failed attempts. Try again in ${Math.ceil((e.blockUntil - Date.now()) / 60000)} min.`
+        : "Invalid email or password",
+    });
+  }
+
+  rlReset(ip);
+  logAudit({ email: imapUser, ip, userAgent, domain, imapServer: matchedHost, success: true, blocked: false });
 
   const { token, expires } = await createSession(imapUser, imapUser, imapPass, matchedHost, matchedPort);
   res.cookie("session", token, {
@@ -386,6 +408,42 @@ app.get("/auth/me", async (req, res) => {
   if (!session) return res.status(401).json({ error: "Unauthorized" });
   res.json({ email: session.email });
 });
+
+// ── Rate limiter (per IP, in-memory) ─────────────────────────────────────────
+const RATE_MAX     = 5;                  // failures before block
+const RATE_WINDOW  = 15 * 60 * 1000;    // 15-minute failure window
+const RATE_BLOCK   = 15 * 60 * 1000;    // block duration after limit hit
+const rateLimitMap = new Map();          // ip → { failures, windowStart, blockUntil }
+
+function getClientIp(req) {
+  return (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+}
+
+function rlCheck(ip) {
+  const now = Date.now();
+  const e   = rateLimitMap.get(ip);
+  if (!e) return { blocked: false };
+  if (e.blockUntil && now < e.blockUntil)
+    return { blocked: true, remainingSec: Math.ceil((e.blockUntil - now) / 1000) };
+  if (now - e.windowStart > RATE_WINDOW) { rateLimitMap.delete(ip); return { blocked: false }; }
+  return { blocked: false };
+}
+
+function rlFailure(ip) {
+  const now = Date.now();
+  const e   = rateLimitMap.get(ip) || { failures: 0, windowStart: now, blockUntil: null };
+  if (now - e.windowStart > RATE_WINDOW) { e.failures = 0; e.windowStart = now; e.blockUntil = null; }
+  e.failures++;
+  if (e.failures >= RATE_MAX) e.blockUntil = now + RATE_BLOCK;
+  rateLimitMap.set(ip, e);
+}
+
+function rlReset(ip) { rateLimitMap.delete(ip); }
+
+// Helper: log a login attempt to the DB (fire-and-forget)
+function logAudit(data) {
+  prisma.loginAudit.create({ data }).catch(() => {});
+}
 
 // ── Public: list configured IMAP servers for login page ──────────────────────
 app.get("/imap-servers", async (_req, res) => {
@@ -493,6 +551,37 @@ app.delete("/admin/imap-servers/:id", requireAdmin, async (req, res) => {
   } catch {
     res.status(404).json({ error: "Server not found" });
   }
+});
+
+// ── Admin audit endpoints ─────────────────────────────────────────────────────
+
+// GET /admin/audits?page=1&limit=50
+app.get("/admin/audits", requireAdmin, async (req, res) => {
+  const page  = Math.max(1, parseInt(req.query.page)  || 1);
+  const limit = Math.min(200, parseInt(req.query.limit) || 50);
+  const skip  = (page - 1) * limit;
+
+  const [audits, total] = await Promise.all([
+    prisma.loginAudit.findMany({ orderBy: { createdAt: "desc" }, skip, take: limit }),
+    prisma.loginAudit.count(),
+  ]);
+
+  // Attach live rate-limit state
+  const now = Date.now();
+  const rateLimited = [];
+  for (const [ip, e] of rateLimitMap.entries()) {
+    if (e.blockUntil && now < e.blockUntil) {
+      rateLimited.push({ ip, failures: e.failures, blockUntil: new Date(e.blockUntil).toISOString() });
+    }
+  }
+
+  res.json({ audits, total, page, pages: Math.ceil(total / limit), rateLimited });
+});
+
+// DELETE /admin/audits/rate-limits/:ip — manually unblock an IP
+app.delete("/admin/audits/rate-limits/:ip", requireAdmin, (req, res) => {
+  rateLimitMap.delete(decodeURIComponent(req.params.ip));
+  res.json({ ok: true });
 });
 
 // ── Apply auth middleware to all subsequent routes ────────────────────────────

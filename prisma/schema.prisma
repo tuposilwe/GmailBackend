@@ -63,6 +63,22 @@ model UserSettings {
   @@map("user_settings")
 }
 
+model LoginAudit {
+  id         Int      @id @default(autoincrement())
+  email      String   @default("") @map("email")
+  ip         String   @default("") @map("ip")
+  userAgent  String   @default("") @db.Text @map("user_agent")
+  domain     String   @default("") @map("domain")
+  imapServer String   @default("") @map("imap_server")
+  success    Boolean  @map("success")
+  blocked    Boolean  @default(false) @map("blocked")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([ip])
+  @@index([createdAt])
+  @@map("login_audits")
+}
+
 model ImapServer {
   id        Int      @id @default(autoincrement())
   label     String   @map("label")
