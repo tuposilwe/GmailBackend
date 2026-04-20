@@ -57,7 +57,8 @@ model Session {
 }
 
 model UserSettings {
-  id Int @id @default(autoincrement())
+  userEmail   String  @id @map("user_email")
+  readingPane Boolean @default(false) @map("reading_pane")
 
   @@map("user_settings")
 }

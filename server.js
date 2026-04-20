@@ -110,6 +110,13 @@ function attSetAll(uid, folder, attachments) {
   });
 }
 
+// Safe date parser — returns a valid Date or a fallback (epoch) so .toISOString() never throws.
+function safeDate(raw) {
+  if (!raw) return new Date(0);
+  const d = new Date(raw);
+  return isNaN(d.getTime()) ? new Date(0) : d;
+}
+
 // Prefetch bodies for a list of {id, folder} email stubs in the background.
 // Uses a dedicated IMAP connection so it never blocks active requests.
 // Skips any uid already cached. Silently swallows errors.
@@ -1050,7 +1057,7 @@ app.get("/emails", async (req, res) => {
           const fromObj     = msg.envelope.from?.[0];
           const senderEmail = fromObj?.address || "unknown@unknown.com";
           const senderName  = fromObj?.name || senderEmail.split("@")[0];
-          const date        = new Date(msg.envelope.date);
+          const date        = safeDate(msg.envelope.date);
           const isToday     = date.toDateString() === new Date().toDateString();
           const timeStr     = isToday
             ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
@@ -1094,7 +1101,7 @@ app.get("/emails/starred", async (req, res) => {
             const fromObj     = msg.envelope.from?.[0];
             const senderEmail = fromObj?.address || "unknown@unknown.com";
             const senderName  = fromObj?.name || senderEmail.split("@")[0];
-            const date        = new Date(msg.envelope.date);
+            const date        = safeDate(msg.envelope.date);
             const isToday     = date.toDateString() === new Date().toDateString();
             emails.push({
               id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: true,
@@ -1137,7 +1144,7 @@ app.get("/emails/sent", async (req, res) => {
         for await (const msg of client.fetch(`${start}:${end}`, { envelope: true, bodyStructure: true, flags: true })) {
           const toList    = msg.envelope.to || [];
           const toDisplay = toList.map(t => t.name || t.address).filter(Boolean).join(", ") || "—";
-          const date      = new Date(msg.envelope.date);
+          const date      = safeDate(msg.envelope.date);
           const isToday   = date.toDateString() === new Date().toDateString();
           emails.push({
             id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: msg.flags.has("\\Flagged"),
@@ -1181,7 +1188,7 @@ app.get("/emails/drafts", async (req, res) => {
         for await (const msg of client.fetch(`${start}:${end}`, { envelope: true, bodyStructure: true, flags: true })) {
           const toList    = msg.envelope.to || [];
           const toDisplay = toList.map(t => t.name || t.address).filter(Boolean).join(", ") || "—";
-          const date      = new Date(msg.envelope.date || Date.now());
+          const date      = safeDate(msg.envelope.date);
           const isToday   = date.toDateString() === new Date().toDateString();
           emails.push({
             id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: msg.flags.has("\\Flagged"),
@@ -1245,7 +1252,7 @@ app.get("/emails/snoozed", async (req, res) => {
             const fromObj     = msg.envelope.from?.[0];
             const senderEmail = fromObj?.address || "unknown@unknown.com";
             const senderName  = fromObj?.name || senderEmail.split("@")[0];
-            const date        = new Date(msg.envelope.date || Date.now());
+            const date        = safeDate(msg.envelope.date);
             const isToday     = date.toDateString() === new Date().toDateString();
             const rowData     = folderRows.find(r => r.uid === msg.uid);
             emailMap[`${msg.uid}:${folderHint}`] = {
@@ -1322,7 +1329,7 @@ app.get("/emails/spam", async (req, res) => {
           const fromObj     = msg.envelope.from?.[0];
           const senderEmail = fromObj?.address || "unknown@unknown.com";
           const senderName  = fromObj?.name || senderEmail.split("@")[0];
-          const date        = new Date(msg.envelope.date || Date.now());
+          const date        = safeDate(msg.envelope.date);
           const isToday     = date.toDateString() === new Date().toDateString();
           emails.push({
             id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: msg.flags.has("\\Flagged"),
@@ -1367,7 +1374,7 @@ app.get("/emails/trash", async (req, res) => {
           const fromObj     = msg.envelope.from?.[0];
           const senderEmail = fromObj?.address || "unknown@unknown.com";
           const senderName  = fromObj?.name || senderEmail.split("@")[0];
-          const date        = new Date(msg.envelope.date || Date.now());
+          const date        = safeDate(msg.envelope.date);
           const isToday     = date.toDateString() === new Date().toDateString();
           emails.push({
             id: msg.uid, unread: !msg.flags.has("\\Seen"), starred: msg.flags.has("\\Flagged"),
@@ -1416,7 +1423,7 @@ app.get("/emails/thread", async (req, res) => {
           for await (const msg of client.fetch(uids, { envelope: true, flags: true }, { uid: true })) {
             const fromObj = msg.envelope.from?.[0];
             const toList  = msg.envelope.to || [];
-            const date    = new Date(msg.envelope.date);
+            const date    = safeDate(msg.envelope.date);
             const isToday = date.toDateString() === new Date().toDateString();
             const senderEmail = folder === "sent" ? (toList[0]?.address || "") : (fromObj?.address || "");
             const senderName  = folder === "sent"
@@ -1514,7 +1521,7 @@ app.get("/emails/search", async (req, res) => {
             const fromObj     = msg.envelope.from?.[0];
             const senderEmail = fromObj?.address || "unknown@unknown.com";
             const senderName  = fromObj?.name || senderEmail.split("@")[0];
-            const date        = new Date(msg.envelope.date);
+            const date        = safeDate(msg.envelope.date);
             const isToday     = date.toDateString() === new Date().toDateString();
             const timeStr     = isToday
               ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
@@ -2196,6 +2203,27 @@ process.on('beforeExit', async () => {
 
 // ── User settings endpoints ───────────────────────────────────────────────────
 
+// GET /user-settings — return settings for the logged-in user
+app.get("/user-settings", async (req, res) => {
+  const row = await prisma.userSettings.findUnique({ where: { userEmail: req.session.email } });
+  res.json({ readingPane: row?.readingPane ?? false });
+});
+
+// PATCH /user-settings — update one or more settings
+app.patch("/user-settings", async (req, res) => {
+  const { readingPane } = req.body || {};
+  const data = {};
+  if (typeof readingPane === "boolean") data.readingPane = readingPane;
+  if (Object.keys(data).length === 0) return res.status(400).json({ error: "Nothing to update" });
+
+  const row = await prisma.userSettings.upsert({
+    where:  { userEmail: req.session.email },
+    create: { userEmail: req.session.email, ...data },
+    update: data,
+  });
+  res.json({ readingPane: row.readingPane });
+});
+
 // Serve React production build
 const buildPath = path.join(__dirname, "../my-gmail/build");
 app.use(express.static(buildPath));
@@ -2272,7 +2300,7 @@ async function runImapIdle(user, pass, signal, onNew, host, port) {
             const senderName = fromObj?.name || fromObj?.address?.split("@")[0] || "Unknown";
             const senderEmail = fromObj?.address || "";
             const subject = msg.envelope.subject || "(no subject)";
-            const date = new Date(msg.envelope.date);
+            const date = safeDate(msg.envelope.date);
             const isToday = date.toDateString() === new Date().toDateString();
             fetched.push({
               id: msg.uid,
